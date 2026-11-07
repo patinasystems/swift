@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "upstream_revision": "95b2630b232f090e091e81fc668b63efcb3b6110",
+  "repositories": {
+    "cmark": "437611671145d47e6d9679761b8a5987766f4ae5",
+    "llvm-project": "248b8c1fc264fc63ee3e159f283ad471738c025a",
+    "swift-syntax": "9e3e3d5adee0f5577166f09dc535e528e7ad8641"
+  }
+}
