@@ -77,7 +77,8 @@ from Pat's outliers. Without those filters, capture all compile jobs of the
 selected modules, including ordinary expressions. Preserve this broader corpus
 for detecting regressions rather than selecting only cases that improve.
 
-The manifest records the producing frontend's version and binary hash, batch boundaries, primary files, all source arguments, the
+The manifest records the producing frontend's version and binary hash, batch
+boundaries, primary files, all source arguments, the
 working directory, response files, explicit imported modules/PCMs, plugin
 executables, and SDK settings. These inputs are content-hashed. It does not copy
 or mutate Pat's source lane or DerivedData. If Pat later reuses that lane and an
@@ -120,7 +121,8 @@ For A/B, remove `--control` and supply the `compiler.json` files produced by the
 unmodified and patched source builds. Both must have matching upstream revision,
 dependency-lock digest, and build options; identical compiler binaries are
 rejected. Imported binary modules must be compatible with both frontends. A
-captured frontend version or binary mismatch with the baseline is a failed run, never an accepted timing sample;
+captured frontend version or binary mismatch with the baseline is a failed run,
+never an accepted timing sample;
 regenerate the application dependencies using the experimental compiler before
 attempting that comparison.
 
@@ -142,13 +144,17 @@ ratios are reported separately from wall-time ratios.
 
 ## Prove incremental scheduling
 
-Before changing the algorithm, add scheduling-work counters to the unmodified
-baseline, and include that identical instrumentation in the candidate:
+After establishing the unmodified baseline, the next measurement patch should
+add scheduling-work counters shared by both arms:
 
 - disjunction selections and inactive constraints visited;
 - disjunctions ranked;
 - binding selections, type variables visited, and binding sets ranked;
 - dirty candidates revisited and queue insertions/updates, once implemented.
+
+These new counters are follow-on work. The current runner requires a pristine
+baseline at the pinned revision. Pin the shared instrumentation revision and
+extend that provenance check before comparing counter-instrumented builds.
 
 Existing scope/trail counters measure search size. A scheduling improvement
 should reduce ranking/scanning work without silently changing the selected

@@ -15,6 +15,16 @@ import sys
 from solver_bench import digest, load, output, record_compiler, save
 
 
+def compiler_diff(root, revision):
+    # Compiler entry points and generators also live outside lib/include.
+    # Exclude only this measurement tool directory from the source record.
+    paths = ['.', ':(exclude)utils/patina/**']
+    untracked = output(['git', 'ls-files', '--others', '--exclude-standard', '--', *paths], root)
+    if untracked:
+        raise ValueError('Stage new source files before building: ' + untracked.splitlines()[0])
+    return output(['git', 'diff', '--binary', revision, '--', *paths], root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--name', required=True)
@@ -55,8 +65,7 @@ def main():
         subprocess.run([*command, '--dry-run'], cwd=root, check=True)
         return
     destination.mkdir(parents=True)
-    source_diff = output(['git', 'diff', '--binary', lock['upstream_revision'], '--',
-                          'lib', 'include', 'SwiftCompilerSources', 'CMakeLists.txt', 'cmake'], root)
+    source_diff = compiler_diff(root, lock['upstream_revision'])
     if args.name == 'upstream' and source_diff:
         raise ValueError('The upstream baseline must have no compiler-source changes')
     source_head = output(['git', 'rev-parse', 'HEAD'], root)
@@ -77,8 +86,7 @@ def main():
     if process.returncode:
         save(destination / 'build.json', {'status': 'failed', 'exit_code': process.returncode, **provenance})
         raise ValueError(f'Compiler build failed; inspect {destination / "build.log"}')
-    current_diff = output(['git', 'diff', '--binary', lock['upstream_revision'], '--',
-                           'lib', 'include', 'SwiftCompilerSources', 'CMakeLists.txt', 'cmake'], root)
+    current_diff = compiler_diff(root, lock['upstream_revision'])
     if current_diff != source_diff:
         raise ValueError('Compiler sources changed during the build')
     build = root.parent / 'build/patina-solver/swift-macosx-arm64'

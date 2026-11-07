@@ -54,6 +54,7 @@ def invoke(root, record, selection, destination, cohort):
     started = time.perf_counter()
     with (destination / 'pat.json').open('wb') as stdout, (destination / 'progress.log').open('wb') as stderr:
         result = subprocess.run(command, cwd=root, env=env, stdout=stdout, stderr=stderr)
+    elapsed = time.perf_counter() - started
     receipt = load(destination / 'pat.json')
     expected_failure = cohort == 'error'
     if expected_failure:
@@ -73,7 +74,7 @@ def invoke(root, record, selection, destination, cohort):
         raise ValueError(f'Pat build failed; inspect {destination}')
     snapshots = [e.get('summary') for e in receipt.get('result', {}).get('evidence', [])
                  if e.get('kind') == 'source-snapshot' and e.get('status') == 'passed']
-    return {'seconds': time.perf_counter() - started, 'pat_receipt': str(destination / 'pat.json'),
+    return {'seconds': elapsed, 'pat_receipt': str(destination / 'pat.json'),
             'load_average': list(os.getloadavg()),
             'build_state': receipt.get('result', {}).get('buildState', {}),
             'failed_build_log': receipt.get('error', {}).get('details', {}).get('logPath'),
