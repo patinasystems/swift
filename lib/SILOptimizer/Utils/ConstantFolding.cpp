@@ -2021,7 +2021,15 @@ ConstantFolder::processWorkList() {
     if (!ChangedAggregateUses.empty()) {
       if (auto use = ChangedAggregateUses.pop_back_val()) {
         Operand *changedUse = *use;
-        foldUser(changedUse->get()->getDefiningInstruction(), changedUse);
+        // DCE can drop an operand before its owner's deletion callback runs.
+        // Cast observation can also leave an unchanged argument or undef here.
+        // Only a current aggregate definition exposes aggregate projections.
+        if (SILValue value = changedUse->get()) {
+          if (auto *inst = value->getDefiningInstruction()) {
+            if (isa<StructInst>(inst) || isa<TupleInst>(inst))
+              foldUser(inst, changedUse);
+          }
+        }
         deleter.cleanupDeadInstructions();
       }
       continue;
