@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import solver_bench as bench
 import synthetic_workloads
+from build_compiler import retain_runtime_libraries
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -229,6 +230,25 @@ class BenchmarkTests(unittest.TestCase):
             a['provenance']['compiler_source_diff'] = 'modified baseline'
             with self.assertRaisesRegex(ValueError, 'unmodified upstream'):
                 bench.validate_pair(a, b)
+
+    def test_retained_companion_libraries_are_independent_and_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build, retained = root / 'build', root / 'retained'
+            library = build / 'lib/swift/host/compiler/lib_CompilerSwiftSyntax.dylib'
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b'compiled library')
+            hashes = retain_runtime_libraries(build, retained)
+            executable = retained / 'bin/swift-frontend'
+            executable.parent.mkdir()
+            executable.write_bytes(b'frontend')
+            record = {'executable': str(executable), 'sha256': bench.digest(executable),
+                      'provenance': {'runtime_libraries': hashes}}
+            library.write_bytes(b'rebuilt later')
+            bench.verify_compiler(record)
+            (retained / next(iter(hashes))).write_bytes(b'changed companion')
+            with self.assertRaisesRegex(ValueError, 'companion library changed'):
+                bench.verify_compiler(record)
 
     def samples(self, candidate_seconds=1, stderr='same', rss=100):
         return [{'round': i, 'arm': arm, 'job': 'job',

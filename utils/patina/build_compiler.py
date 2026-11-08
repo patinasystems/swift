@@ -25,6 +25,22 @@ def compiler_diff(root, revision):
     return output(['git', 'diff', '--binary', revision, '--', *paths], root)
 
 
+def retain_runtime_libraries(build, destination):
+    relative = Path('lib/swift/host/compiler')
+    source = build / relative
+    libraries = sorted(source.glob('*.dylib'))
+    if not libraries:
+        raise ValueError('Compiler SwiftSyntax runtime libraries were not built')
+    retained = destination / relative
+    retained.mkdir(parents=True, exist_ok=False)
+    hashes = {}
+    for library in libraries:
+        target = retained / library.name
+        shutil.copy2(library, target, follow_symlinks=True)
+        hashes[str(relative / library.name)] = digest(target)
+    return hashes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--name', required=True)
@@ -94,6 +110,7 @@ def main():
     retained = destination / 'bin/swift-frontend'
     retained.parent.mkdir()
     shutil.copy2(executable, retained)
+    provenance['runtime_libraries'] = retain_runtime_libraries(build, destination)
     # Keep the frontend's resource lookup explicit: a retained standalone binary
     # does not live inside an installed .xctoolchain. SDK interfaces are rebuilt
     # into benchmark-owned module caches by the replay runner.

@@ -352,6 +352,10 @@ def record_compiler(executable, destination, provenance=None):
 def verify_compiler(record):
     if digest(record['executable']) != record['sha256']:
         raise ValueError(f'Compiler changed: {record["executable"]}')
+    root = Path(record['executable']).parent.parent
+    for relative, expected in record.get('provenance', {}).get('runtime_libraries', {}).items():
+        if digest(root / relative) != expected:
+            raise ValueError(f'Compiler companion library changed: {relative}')
 
 
 def validate_capture_compiler(manifest, baseline):
@@ -370,7 +374,9 @@ def validate_pair(baseline, candidate, control=False):
     for record in (baseline, candidate):
         verify_compiler(record)
     if control:
-        if baseline['sha256'] != candidate['sha256']:
+        if (baseline['sha256'] != candidate['sha256'] or
+            baseline['provenance'].get('runtime_libraries', {}) !=
+                candidate['provenance'].get('runtime_libraries', {})):
             raise ValueError('An A/A control requires the same compiler binary')
         return
     if baseline['sha256'] == candidate['sha256']:

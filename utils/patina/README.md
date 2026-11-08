@@ -42,7 +42,7 @@ From a Kitchen worktree:
 The script respects a smaller `PAT_JOB_CORES` grant, builds Release with
 assertions, includes Swift compiler modules through `hosttools`, and limits
 LLVM to AArch64. It does not install or replace a system toolchain. The retained
-binary, source diff, dependency-lock digest, build options, host compiler
+binary and companion SwiftSyntax libraries, source diff, dependency-lock digest, build options, host compiler
 versions, and linked libraries are recorded together. Rebuilds reuse the build
 directory; each retained compiler output directory must be new.
 
