@@ -250,7 +250,11 @@ SILCombiner::SILCombiner(SILFunctionTransform *trans,
   auto *invocation =
       trans->getPassManager()->getSwiftPassInvocation()->getCurrent();
   invocation->injectSILCombiner(this);
-  if (EnableChangedRegions) {
+  // A block-granular region cannot skip any instructions in a one-block
+  // function. Keep those invocations entirely on the original path.
+  auto &function = *trans->getFunction();
+  if (EnableChangedRegions && !function.empty() &&
+      std::next(function.begin()) != function.end()) {
     changeTracker.emplace(*trans->getFunction());
     deleter.getCallbacks() =
         deleter.getCallbacks().withChangeTracker(getChangeTracker());
