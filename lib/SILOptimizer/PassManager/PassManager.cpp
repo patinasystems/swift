@@ -750,12 +750,17 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
     return;
   }
 
-  // Only these producers/consumers have an audited metadata contract. An
-  // executed unknown pass can alter context without instruction notifications.
-  // Completed/disabled passes above never run, so they preserve the handoff.
+  // The native completed bit certifies that the original SILCombine result is
+  // still current under the pass invalidation contract. Preserve only that
+  // empty saturation record; a dirty post-CSE payload has no such certificate.
+  // Completed/disabled passes above never run and need no additional barrier.
+  bool hasSaturationCertificate = silCombineRegion.function == F &&
+      silCombineRegion.blocks.empty() &&
+      completedPasses.test((size_t)PassKind::SILCombine);
   if (kind != PassKind::SILCombine &&
       kind != PassKind::CommonSubexpressionElimination &&
-      kind != PassKind::HighLevelCommonSubexpressionElimination)
+      kind != PassKind::HighLevelCommonSubexpressionElimination &&
+      !hasSaturationCertificate)
     invalidateSILCombineRegion();
 
   updateSILModuleStatsBeforeTransform(F->getModule(), SFT, *this, NumPassesRun);
@@ -1650,6 +1655,12 @@ bool SILPassManager::takeSILCombineRegion(
 bool SILPassManager::takeCSEBaseline(SILFunction *F, SILCombineRegion &region) {
   if (SILOptProfileRepeat != 1 || silCombineRegion.function != F)
     return false;
+  auto completed = CompletedPassesMap.find(F);
+  if (completed == CompletedPassesMap.end() ||
+      !completed->second.test((size_t)PassKind::SILCombine)) {
+    invalidateSILCombineRegion();
+    return false;
+  }
   region = std::move(silCombineRegion);
   silCombineRegion.clear();
   return true;
