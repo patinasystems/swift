@@ -16,6 +16,7 @@
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/SemanticAttrs.h"
+#include "swift/Basic/BlotSetVector.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/PatternMatch.h"
 #include "swift/SIL/SILBuilder.h"
@@ -1234,7 +1235,6 @@ static SILValue constantFoldIsConcrete(BuiltinInst *BI) {
   auto *inst = builder.createIntegerLiteral(
       BI->getLoc(), SILType::getBuiltinIntegerType(1, builder.getASTContext()),
       true);
-  BI->replaceAllUsesWith(inst);
   return inst;
 }
 
@@ -1645,13 +1645,12 @@ static bool isFoldable(SILInstruction *I) {
          isa<StringLiteralInst>(I);
 }
 
-/// Given a buitin instruction calling globalStringTablePointer, check whether
-/// the string passed to the builtin is constructed from a literal and if so,
-/// replace the uses of the builtin instruction with the string_literal inst.
+/// Given a builtin instruction calling globalStringTablePointer, return the
+/// string literal from which its string argument was constructed, if any.
 /// Otherwise, emit diagnostics if the function containing the builtin is not a
 /// transparent function. Transparent functions will be handled in their
 /// callers.
-static bool
+static SILValue
 constantFoldGlobalStringTablePointerBuiltin(BuiltinInst *bi,
                                             bool enableDiagnostics) {
   // Look through string initializer to extract the string_literal instruction.
@@ -1670,16 +1669,15 @@ constantFoldGlobalStringTablePointerBuiltin(BuiltinInst *bi,
       diagnose(caller->getASTContext(), bi->getLoc().getSourceLoc(),
                diag::global_string_pointer_on_non_constant);
     }
-    return false;
+    return SILValue();
   }
 
-  // Replace the builtin by the first argument of the "string.makeUTF8"
-  // initializer which must be a string_literal instruction.
+  // The first argument of the "string.makeUTF8" initializer must be a
+  // string_literal instruction.
   SILValue stringLiteral = stringInitSite.getArgument(0);
   assert(isa<StringLiteralInst>(stringLiteral));
 
-  bi->replaceAllUsesWith(stringLiteral);
-  return true;
+  return stringLiteral;
 }
 
 /// Initialize the worklist to all of the constant instructions.
@@ -1812,16 +1810,63 @@ ConstantFolder::processWorkList() {
   // This is used to avoid duplicate error reporting in case we reach the same
   // instruction from different entry points in the WorkList.
   llvm::DenseSet<SILInstruction *> ErrorSet;
+
+  // An aggregate's existing projections need only be visited once. Replacing
+  // a field updates projections that were already forwarded through that field.
+  llvm::DenseSet<SILInstruction *> ProcessedAggregates;
+
+  // RAUW can expose new projections of an aggregate that was already visited.
+  // Visit only the changed uses, rather than rescanning all of its old users.
+  SmallBlotSetVector<Operand *, 16> ChangedAggregateUses;
+
+  auto removeFromWorkLists = [&](SILInstruction *inst) {
+    WorkList.remove(inst);
+    ProcessedAggregates.erase(inst);
+    ErrorSet.erase(inst);
+    if (!ChangedAggregateUses.empty()) {
+      for (auto &operand : inst->getAllOperands())
+        ChangedAggregateUses.erase(&operand);
+    }
+  };
+
+  auto invalidateAggregateOperands = [&](SILValue oldValue, SILValue newValue) {
+    // Destructure forwarding also depends on the field's ownership and type.
+    // Reconsider previously ineligible fields if either of these changes.
+    if (oldValue->getOwnershipKind() == newValue->getOwnershipKind() &&
+        oldValue->getType() == newValue->getType())
+      return;
+    for (auto *use : oldValue->getUses()) {
+      auto *user = use->getUser();
+      if (isa<StructInst>(user) || isa<TupleInst>(user)) {
+        ProcessedAggregates.erase(user);
+        WorkList.insert(user);
+      }
+    }
+  };
+  auto replaceUses = [&](SILValue oldValue, SILValue newValue) {
+    assert(oldValue != newValue && "Cannot RAUW a value with itself");
+    invalidateAggregateOperands(oldValue, newValue);
+    // Preserve changed operand addresses before RAUW splices them into the new
+    // value's use list. Deletion callbacks erase them before their owner dies.
+    if (auto *inst = newValue->getDefiningInstruction()) {
+      if (isa<StructInst>(inst) || isa<TupleInst>(inst)) {
+        for (auto *use : oldValue->getUses())
+          ChangedAggregateUses.insert(use);
+      }
+    }
+    oldValue->replaceAllUsesWith(newValue);
+  };
+
   CastOptimizer CastOpt(FuncBuilder, nullptr /*SILBuilderContext*/,
                         /* replaceValueUsesAction */
                         [&](SILValue oldValue, SILValue newValue) {
                           InvalidateInstructions = true;
-                          oldValue->replaceAllUsesWith(newValue);
+                          replaceUses(oldValue, newValue);
                         },
                         /* ReplaceInstUsesAction */
                         [&](SingleValueInstruction *I, ValueBase *V) {
                           InvalidateInstructions = true;
-                          I->replaceAllUsesWith(V);
+                          replaceUses(I, V);
                         },
                         /* EraseAction */
                         [&](SILInstruction *I) {
@@ -1838,7 +1883,7 @@ ConstantFolder::processWorkList() {
 
                           InvalidateInstructions = true;
 
-                          WorkList.remove(I);
+                          removeFromWorkLists(I);
                           I->eraseFromParent();
                         });
   if (EnableDiagnostics)
@@ -1846,7 +1891,7 @@ ConstantFolder::processWorkList() {
 
   auto callbacks =
       InstModCallbacks().onDelete([&](SILInstruction *instToDelete) {
-        WorkList.remove(instToDelete);
+        removeFromWorkLists(instToDelete);
         InvalidateInstructions = true;
         instToDelete->eraseFromParent();
       });
@@ -1855,8 +1900,144 @@ ConstantFolder::processWorkList() {
   // An out parameter array that we use to return new simplified results from
   // constantFoldInstruction.
   SmallVector<SILValue, 8> ConstantFoldedResults;
-  while (!WorkList.empty()) {
+  auto foldUser = [&](SILInstruction *I, Operand *Use) {
+    SILInstruction *User = Use->getUser();
+    LLVM_DEBUG(llvm::dbgs() << "    User: " << *User);
+
+    // It is possible that we had processed this user already. Do not try to
+    // fold it again if we had previously produced an error while folding
+    // it.  It is not always possible to fold an instruction in case of
+    // error.
+    if (ErrorSet.count(User))
+      return;
+
+    // Some constant users may indirectly cause folding of their users.
+    if (isa<StructInst>(User) || isa<TupleInst>(User)) {
+      if (!ProcessedAggregates.count(User))
+        WorkList.insert(User);
+      return;
+    }
+
+    // Always consider cond_fail instructions as potential for DCE.  If the
+    // expression feeding them is false, they are dead.  We can't handle
+    // this as part of the constant folding logic, because there is no value
+    // they can produce (other than empty tuple, which is wasteful).
+    if (isa<CondFailInst>(User))
+      deleter.trackIfDead(User);
+
+    // See if we have an instruction that is read none and has a stateless
+    // inverse. If we do, add it to the worklist so we can check its users
+    // for the inverse operation and see if we can perform constant folding
+    // on the inverse operation. This can eliminate annoying "round trip"s.
+    //
+    // NOTE: We are assuming on purpose that our inverse will be read none,
+    // since otherwise we wouldn't be able to constant fold it this way.
+    if (isReadNoneAndInvertible(User)) {
+      WorkList.insert(User);
+    }
+
+    // See if we have a CondFailMessage of a string_Literal. If we do, add
+    // it to the worklist, so we can clean it up.
+    if (isApplyOfBuiltin(*User, BuiltinValueKind::CondFailMessage)) {
+      if (auto *sli = dyn_cast_or_null<StringLiteralInst>(I)) {
+        if (sli->getEncoding() == StringLiteralInst::Encoding::UTF8) {
+          WorkList.insert(User);
+        }
+      }
+    }
+
+    // If the user is a bitcast, we may be able to constant
+    // fold its users.
+    if (isApplyOfBuiltin(*User, BuiltinValueKind::BitCast)) {
+      WorkList.insert(User);
+    }
+
+    // Initialize ResultsInError as a None optional.
+    //
+    // We are essentially using this optional to represent 3 states: true,
+    // false, and n/a.
+    std::optional<bool> ResultsInError;
+
+    // If we are asked to emit diagnostics, override ResultsInError with a
+    // Some optional initialized to false.
+    if (EnableDiagnostics)
+      ResultsInError = false;
+
+    // Try to fold the user. If ResultsInError is None, we do not emit any
+    // diagnostics. If ResultsInError is some, we use it as our return
+    // value.
+    ConstantFoldedResults.clear();
+    bool Success =
+        constantFoldInstruction(Use, ResultsInError, ConstantFoldedResults);
+
+    // If we did not pass in a None and the optional is set to true, add the
+    // user to our error set.
+    if (ResultsInError.has_value() && ResultsInError.value())
+      ErrorSet.insert(User);
+
+    // We failed to constant propagate... continue...
+    if (!Success || llvm::none_of(ConstantFoldedResults,
+                                  [](SILValue v) { return bool(v); }))
+      return;
+
+    // Now iterate over our new results.
+    for (auto pair : llvm::enumerate(ConstantFoldedResults)) {
+      SILValue C = pair.value();
+      unsigned Index = pair.index();
+
+      // Skip any values that we couldn't simplify.
+      if (!C)
+        continue;
+
+      // Handle a corner case: if this instruction is an unreachable CFG
+      // loop there is no defined dominance order and we can end up with
+      // loops in the use-def chain. Just bail in this case.
+      if (C->getDefiningInstruction() == User)
+        continue;
+
+      // Partial destructures can retain owned results that cannot be forwarded.
+      // Do not reschedule a result whose uses were already replaced.
+      SILValue r = User->getResult(Index);
+      if (r->use_empty()) {
+        deleter.trackIfDead(User);
+        continue;
+      }
+
+      ++NumInstFolded;
+      replaceUses(r, C);
+      // Aggregates schedule their changed users in replaceUses. Other values
+      // retain the existing definition-driven folding and builtin fast paths.
+      if (auto *inst = C->getDefiningInstruction()) {
+        if (!isa<StructInst>(inst) && !isa<TupleInst>(inst))
+          WorkList.insert(inst);
+      }
+      // Record the user if it is dead to perform the necessary cleanups
+      // later.
+      deleter.trackIfDead(User);
+    }
+  };
+
+  while (!WorkList.empty() || !ChangedAggregateUses.empty()) {
+    if (!ChangedAggregateUses.empty()) {
+      if (auto use = ChangedAggregateUses.pop_back_val()) {
+        Operand *changedUse = *use;
+        // DCE can drop an operand before its owner's deletion callback runs.
+        // Cast observation can also leave an unchanged argument or undef here.
+        // Only a current aggregate definition exposes aggregate projections.
+        if (SILValue value = changedUse->get()) {
+          if (auto *inst = value->getDefiningInstruction()) {
+            if (isa<StructInst>(inst) || isa<TupleInst>(inst))
+              foldUser(inst, changedUse);
+          }
+        }
+        deleter.cleanupDeadInstructions();
+      }
+      continue;
+    }
+
     SILInstruction *I = WorkList.pop_back_val();
+    if (isa<StructInst>(I) || isa<TupleInst>(I))
+      ProcessedAggregates.insert(I);
     assert(I->getParent() && "SILInstruction must have parent.");
 
     LLVM_DEBUG(llvm::dbgs() << "Visiting: " << *I);
@@ -1870,7 +2051,7 @@ ConstantFolder::processWorkList() {
           SILBuilderWithScope B(BI);
           auto AssertConfInt = B.createIntegerLiteral(
             BI->getLoc(), BI->getType(), AssertConfiguration);
-          BI->replaceAllUsesWith(AssertConfInt);
+          replaceUses(BI, AssertConfInt);
           // Schedule users for constant folding.
           WorkList.insert(AssertConfInt);
           // Delete the call.
@@ -1895,7 +2076,7 @@ ConstantFolder::processWorkList() {
       if (auto apply = dyn_cast<ApplyInst>(I)) {
         SILBuilderWithScope B(I);
         auto tru = B.createIntegerLiteral(apply->getLoc(), apply->getType(), 1);
-        apply->replaceAllUsesWith(tru);
+        replaceUses(apply, tru);
         eliminateDeadInstruction(I, deleter.getCallbacks(),
                                  /*assumeFixedLifetimes=*/ !EnableDiagnostics);
         WorkList.insert(tru);
@@ -1914,9 +2095,29 @@ ConstantFolder::processWorkList() {
       switch(I->getKind()) {
       default:
         llvm_unreachable("Unexpected instruction for cast optimizations");
-      case SILInstructionKind::CheckedCastBranchInst:
-        Result = CastOpt.simplifyCheckedCastBranchInst(cast<CheckedCastBranchInst>(I));
+      case SILInstructionKind::CheckedCastBranchInst: {
+        auto *castInst = cast<CheckedCastBranchInst>(I);
+        // CastOptimizer can replace and erase successor arguments without
+        // invoking its RAUW callbacks. Observe this mutation boundary before
+        // calling it: the users' Operand objects survive argument replacement.
+        // Revisit aggregate constructors conservatively if type/ownership changes.
+        SILBasicBlock *successors[] = {castInst->getSuccessBB(),
+                                       castInst->getFailureBB()};
+        for (auto *successor : successors) {
+          for (auto *argument : successor->getArguments()) {
+            for (auto *use : argument->getUses()) {
+              ChangedAggregateUses.insert(use);
+              auto *user = use->getUser();
+              if (isa<StructInst>(user) || isa<TupleInst>(user)) {
+                ProcessedAggregates.erase(user);
+                WorkList.insert(user);
+              }
+            }
+          }
+        }
+        Result = CastOpt.simplifyCheckedCastBranchInst(castInst);
         break;
+      }
       case SILInstructionKind::CheckedCastAddrBranchInst:
         Result = CastOpt.simplifyCheckedCastAddrBranchInst(cast<CheckedCastAddrBranchInst>(I));
         break;
@@ -1943,8 +2144,9 @@ ConstantFolder::processWorkList() {
 
     // Constant fold uses of globalStringTablePointer builtin.
     if (isApplyOfBuiltin(*I, BuiltinValueKind::GlobalStringTablePointer)) {
-      if (constantFoldGlobalStringTablePointerBuiltin(cast<BuiltinInst>(I),
-                                                      EnableDiagnostics)) {
+      if (SILValue value = constantFoldGlobalStringTablePointerBuiltin(
+              cast<BuiltinInst>(I), EnableDiagnostics)) {
+        replaceUses(cast<BuiltinInst>(I), value);
         // Here, the builtin instruction got folded, so clean it up.
         eliminateDeadInstruction(I, deleter.getCallbacks(),
                                  /*assumeFixedLifetimes=*/ !EnableDiagnostics);
@@ -1970,7 +2172,8 @@ ConstantFolder::processWorkList() {
     }
 
     if (isApplyOfBuiltin(*I, BuiltinValueKind::IsConcrete)) {
-      if (constantFoldIsConcrete(cast<BuiltinInst>(I))) {
+      if (SILValue value = constantFoldIsConcrete(cast<BuiltinInst>(I))) {
+        replaceUses(cast<BuiltinInst>(I), value);
         // Here, the builtin instruction got folded, so clean it up.
         recursivelyDeleteTriviallyDeadInstructions(I, /*force*/ true,
                                                    deleter.getCallbacks());
@@ -1994,7 +2197,7 @@ ConstantFolder::processWorkList() {
         auto *inst = builder.createIntegerLiteral(
             BI->getLoc(),
             SILType::getBuiltinIntegerType(1, builder.getASTContext()), val);
-        BI->replaceAllUsesWith(inst);
+        replaceUses(BI, inst);
 
         eliminateDeadInstruction(I, deleter.getCallbacks(),
                                  /*assumeFixedLifetimes=*/ !EnableDiagnostics);
@@ -2008,8 +2211,9 @@ ConstantFolder::processWorkList() {
           // If bi had a result, RAUW.
           if (bi->getResult(0)->getType() !=
               bi->getModule().Types.getEmptyTupleType())
-            bi->replaceAllUsesWith(v);
+            replaceUses(bi, v);
           // Then delete no matter what.
+          removeFromWorkLists(bi);
           bi->eraseFromParent();
           InvalidateInstructions = true;
           continue;
@@ -2018,158 +2222,9 @@ ConstantFolder::processWorkList() {
     }
 
     // Go through all users of the constant and try to fold them.
-
     for (auto Result : I->getResults()) {
-      for (auto *Use : Result->getUses()) {
-        SILInstruction *User = Use->getUser();
-        LLVM_DEBUG(llvm::dbgs() << "    User: " << *User);
-
-        // It is possible that we had processed this user already. Do not try to
-        // fold it again if we had previously produced an error while folding
-        // it.  It is not always possible to fold an instruction in case of
-        // error.
-        if (ErrorSet.count(User))
-          continue;
-
-        // Some constant users may indirectly cause folding of their users.
-        if (isa<StructInst>(User) || isa<TupleInst>(User)) {
-          WorkList.insert(User);
-          continue;
-        }
-
-        // Always consider cond_fail instructions as potential for DCE.  If the
-        // expression feeding them is false, they are dead.  We can't handle
-        // this as part of the constant folding logic, because there is no value
-        // they can produce (other than empty tuple, which is wasteful).
-        if (isa<CondFailInst>(User))
-          deleter.trackIfDead(User);
-
-        // See if we have an instruction that is read none and has a stateless
-        // inverse. If we do, add it to the worklist so we can check its users
-        // for the inverse operation and see if we can perform constant folding
-        // on the inverse operation. This can eliminate annoying "round trip"s.
-        //
-        // NOTE: We are assuming on purpose that our inverse will be read none,
-        // since otherwise we wouldn't be able to constant fold it this way.
-        if (isReadNoneAndInvertible(User)) {
-          WorkList.insert(User);
-        }
-
-        // See if we have a CondFailMessage of a string_Literal. If we do, add
-        // it to the worklist, so we can clean it up.
-        if (isApplyOfBuiltin(*User, BuiltinValueKind::CondFailMessage)) {
-          if (auto *sli = dyn_cast<StringLiteralInst>(I)) {
-            if (sli->getEncoding() == StringLiteralInst::Encoding::UTF8) {
-              WorkList.insert(User);
-            }
-          }
-        }
-
-        // If the user is a bitcast, we may be able to constant
-        // fold its users.
-        if (isApplyOfBuiltin(*User, BuiltinValueKind::BitCast)) {
-          WorkList.insert(User);
-        }
-
-        // Initialize ResultsInError as a None optional.
-        //
-        // We are essentially using this optional to represent 3 states: true,
-        // false, and n/a.
-        std::optional<bool> ResultsInError;
-
-        // If we are asked to emit diagnostics, override ResultsInError with a
-        // Some optional initialized to false.
-        if (EnableDiagnostics)
-          ResultsInError = false;
-
-        // Try to fold the user. If ResultsInError is None, we do not emit any
-        // diagnostics. If ResultsInError is some, we use it as our return
-        // value.
-        ConstantFoldedResults.clear();
-        bool Success =
-            constantFoldInstruction(Use, ResultsInError, ConstantFoldedResults);
-
-        // If we did not pass in a None and the optional is set to true, add the
-        // user to our error set.
-        if (ResultsInError.has_value() && ResultsInError.value())
-          ErrorSet.insert(User);
-
-        // We failed to constant propagate... continue...
-        if (!Success || llvm::none_of(ConstantFoldedResults,
-                                      [](SILValue v) { return bool(v); }))
-          continue;
-
-        // Now iterate over our new results.
-        for (auto pair : llvm::enumerate(ConstantFoldedResults)) {
-          SILValue C = pair.value();
-          unsigned Index = pair.index();
-
-          // Skip any values that we couldn't simplify.
-          if (!C)
-            continue;
-
-          // Handle a corner case: if this instruction is an unreachable CFG
-          // loop there is no defined dominance order and we can end up with
-          // loops in the use-def chain. Just bail in this case.
-          if (C->getDefiningInstruction() == User)
-            continue;
-
-          // Ok, we have succeeded.
-          ++NumInstFolded;
-
-          // We were able to fold, so all users should use the new folded
-          // value. If we don't have any such users, continue.
-          //
-          // NOTE: The reason why we check if our result has uses is that if
-          // User is a MultipleValueInstruction an infinite loop can result if
-          // User has a result different than the one at Index that we can not
-          // constant fold and if C's defining instruction is an aggregate that
-          // defines an operand of I.
-          //
-          // As an elucidating example, consider the following SIL:
-          //
-          //   %w = integer_literal $Builtin.Word, 1
-          //   %0 = struct $Int (%w : $Builtin.Word)                     (*)
-          //   %1 = apply %f() : $@convention(thin) () -> @owned Klass
-          //   %2 = tuple (%0 : $Int, %1 : $Klass)
-          //   (%3, %4) = destructure_tuple %2 : $(Int, Klass)
-          //   store %4 to [init] %mem2: %*Klass
-          //
-          // Without this check, we would infinite loop by processing our
-          // worklist as follows:
-          //
-          // 1. We visit %w and add %0 to the worklist unconditionally since it
-          //    is a StructInst.
-          //
-          // 2. We visit %0 and then since %2 is a tuple, we add %2 to the
-          //    worklist unconditionally.
-          //
-          // 3. We visit %2 and see that it has a destructure_tuple user. We see
-          //    that we can simplify %3 -> %0, but cannot simplify %4. This
-          //    means that if we just assume success if we can RAUW %3 without
-          //    checking if we will actually replace anything, we will add %0's
-          //    defining instruction (*) to the worklist. Q.E.D.
-          //
-          // In contrast, if we realize that RAUWing %3 does nothing and skip
-          // it, we exit the worklist as expected.
-          SILValue r = User->getResult(Index);
-          if (r->use_empty()) {
-            deleter.trackIfDead(User);
-            continue;
-          }
-
-          // Otherwise, do the RAUW.
-          User->getResult(Index)->replaceAllUsesWith(C);
-          // Record the user if it is dead to perform the necessary cleanups
-          // later.
-          deleter.trackIfDead(User);
-
-          // The new constant could be further folded now, add it to the
-          // worklist.
-          if (auto *Inst = C->getDefiningInstruction())
-            WorkList.insert(Inst);
-        }
-      }
+      for (auto *Use : Result->getUses())
+        foldUser(I, Use);
     }
 
     // Eagerly DCE. We do this after visiting all users to ensure we don't
