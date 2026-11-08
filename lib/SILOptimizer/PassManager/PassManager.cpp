@@ -1880,6 +1880,9 @@ irgen::IRGenModule *SwiftPassInvocation::getIRGenModule() {
   return passManager->getIRGenModule();
 }
 
+SwiftPassInvocation::SwiftPassInvocation(SILPassManager *passManager)
+    : SILContext(passManager->getModule()), passManager(passManager) {}
+
 SwiftPassInvocation::SwiftPassInvocation(SILPassManager *passManager,
                                          SILTransform *transform,
                                          SILFunction *function)

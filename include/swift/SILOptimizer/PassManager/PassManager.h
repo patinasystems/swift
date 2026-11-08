@@ -519,9 +519,6 @@ private:
   void viewCallGraph();
 };
 
-inline SwiftPassInvocation::SwiftPassInvocation(SILPassManager *passManager) :
-  SILContext(passManager->getModule()), passManager(passManager)  {}
-
 } // end namespace swift
 
 #endif
