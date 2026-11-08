@@ -68,6 +68,8 @@ def main():
         '--release', '--assertions', '--bootstrapping=hosttools',
         '--skip-build-osx', '--skip-build-benchmarks', '--skip-early-swift-driver',
         '--skip-build-compiler-rt', '--skip-build-clang-tools-extra', '--skip-build-lld',
+        '--build-embedded-stdlib=false',
+        '--extra-llvm-cmake-options=-DLLVM_INCLUDE_RUNTIMES=OFF',
         '--llvm-targets-to-build=AArch64', '--enable-new-runtime-build=false',
         '--native-swift-tools-path=' + str(tools), '--no-swift-pedantic-diagnostics',
         '--extra-swift-cmake-options=-DSWIFT_APPEND_VC_REV=OFF',
