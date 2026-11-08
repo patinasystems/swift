@@ -1,0 +1,219 @@
+// RUN: %empty-directory(%t)
+// RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine %s > %t/full.sil
+// RUN: %FileCheck %s < %t/full.sil
+// RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions %s > %t/regions.sil 2> %t/regions.log
+// RUN: %FileCheck %s < %t/regions.sil
+// RUN: %FileCheck %s --check-prefix=REGION < %t/regions.log
+
+// Check data flow and ownership independently of SSA numbering and comments.
+// The verification flag additionally runs the original full combiner at the
+// same fixed-point boundary, before its stack/lifetime/CFG wrapper repairs.
+sil_stage canonical
+
+import Builtin
+import Swift
+
+class RegionBase {}
+class RegionMiddle : RegionBase {}
+class RegionLeaf : RegionMiddle {}
+
+sil @region_use_owned_middle : $@convention(thin) (@owned RegionMiddle) -> ()
+sil @region_touch : $@convention(thin) () -> ()
+
+// The positive region case needs no operand mutation of a terminator and no
+// Swift instruction helper: initial DCE deletes the unused extract, then the
+// worklist deletes its now-dead tuple producer. Only bb1 needs another sweep.
+// REGION-LABEL: silcombine-regions function=region_dead_producer_subset
+// REGION-SAME: full_seeds={{[1-9][0-9]*}} regional_seeds={{[1-9][0-9]*}}
+// CHECK-LABEL: sil @region_dead_producer_subset
+// CHECK: bb0([[CONDITION:%.*]] : $Builtin.Int1, [[VALUE:%.*]] : $Builtin.Int64):
+// CHECK: cond_br [[CONDITION]], bb1, bb2
+// CHECK: bb1:
+// CHECK-NOT: tuple
+// CHECK: return [[VALUE]] : $Builtin.Int64
+// CHECK: bb2:
+// CHECK: return [[VALUE]] : $Builtin.Int64
+// CHECK: } // end sil function 'region_dead_producer_subset'
+sil @region_dead_producer_subset : $@convention(thin) (Builtin.Int1, Builtin.Int64) -> Builtin.Int64 {
+bb0(%condition : $Builtin.Int1, %value : $Builtin.Int64):
+  cond_br %condition, bb1, bb2
+
+bb1:
+  %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  %unused = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
+  return %value : $Builtin.Int64
+
+bb2:
+  return %value : $Builtin.Int64
+}
+
+// A local RAUW replaces the projection with an argument, not a newly inserted
+// instruction. The first prototype may conservatively fall back because the
+// replaced use is a return operand; it must still preserve both path results.
+// CHECK-LABEL: sil @region_tuple_argument_replacement
+// CHECK: bb0([[COND:%.*]] : $Builtin.Int1, [[LEFT:%.*]] : $Builtin.Int64, [[RIGHT:%.*]] : $Builtin.Int64):
+// CHECK: cond_br [[COND]], bb1, bb2
+// CHECK: bb1:
+// CHECK-NOT: tuple
+// CHECK: return [[LEFT]] : $Builtin.Int64
+// CHECK: bb2:
+// CHECK: return [[RIGHT]] : $Builtin.Int64
+// CHECK: } // end sil function 'region_tuple_argument_replacement'
+sil @region_tuple_argument_replacement : $@convention(thin) (Builtin.Int1, Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
+bb0(%condition : $Builtin.Int1, %left : $Builtin.Int64, %right : $Builtin.Int64):
+  cond_br %condition, bb1, bb2
+
+bb1:
+  %pair = tuple (%left : $Builtin.Int64, %right : $Builtin.Int64)
+  %result = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
+  return %result : $Builtin.Int64
+
+bb2:
+  return %right : $Builtin.Int64
+}
+
+// Both projections become the same value. Folding the comparison then kills
+// the last uses of a producer in an earlier block. Tracking deletion only after
+// dropping operands would lose that producer's dirty neighborhood.
+// CHECK-LABEL: sil @region_deleted_cross_block_uses
+// CHECK-NOT: tuple
+// CHECK-NOT: cmp_eq
+// CHECK: [[TRUE:%.*]] = integer_literal $Builtin.Int1, -1
+// CHECK-NOT: tuple
+// CHECK-NOT: cmp_eq
+// CHECK: return [[TRUE]] : $Builtin.Int1
+// CHECK: } // end sil function 'region_deleted_cross_block_uses'
+sil @region_deleted_cross_block_uses : $@convention(thin) (Builtin.Int64) -> Builtin.Int1 {
+bb0(%value : $Builtin.Int64):
+  %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  br bb1
+
+bb1:
+  %first = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
+  %second = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 1
+  %same = builtin "cmp_eq_Int64"(%first : $Builtin.Int64, %second : $Builtin.Int64) : $Builtin.Int1
+  return %same : $Builtin.Int1
+}
+
+// Two uses in separate successor blocks must both be updated by RAUW. The
+// textual block order deliberately differs from reachable DFS order.
+// CHECK-LABEL: sil @region_nontextual_successor_uses
+// CHECK: bb0([[C:%.*]] : $Builtin.Int1, [[X:%.*]] : $Builtin.Int64, [[Y:%.*]] : $Builtin.Int64):
+// CHECK-NOT: tuple
+// CHECK: cond_br [[C]], bb2, bb1
+// CHECK: bb1:
+// CHECK-NOT: tuple
+// CHECK: return [[Y]] : $Builtin.Int64
+// CHECK: bb2:
+// CHECK-NOT: tuple
+// CHECK: return [[X]] : $Builtin.Int64
+// CHECK: } // end sil function 'region_nontextual_successor_uses'
+sil @region_nontextual_successor_uses : $@convention(thin) (Builtin.Int1, Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
+bb0(%condition : $Builtin.Int1, %left : $Builtin.Int64, %right : $Builtin.Int64):
+  %pair = tuple (%left : $Builtin.Int64, %right : $Builtin.Int64)
+  cond_br %condition, bb2, bb1
+
+bb1:
+  %rightResult = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 1
+  return %rightResult : $Builtin.Int64
+
+bb2:
+  %leftResult = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
+  return %leftResult : $Builtin.Int64
+}
+
+// Replacing a branch changes CFG instruction identity even when dominance and
+// reachability are preserved. It must take the conservative full-scan path.
+// REGION-LABEL: silcombine-regions function=region_branch_rewrite_fallback
+// REGION-SAME: full_seeds={{([2-9]|[1-9][0-9]+)}} regional_seeds=0
+// CHECK-LABEL: sil @region_branch_rewrite_fallback
+// CHECK: bb0([[INPUT:%.*]] : $Builtin.Int1, [[A:%.*]] : $Builtin.Int64, [[B:%.*]] : $Builtin.Int64):
+// CHECK-NOT: builtin "xor_Int1"
+// CHECK: cond_br [[INPUT]], bb2, bb1
+// CHECK: bb1:
+// CHECK: return [[A]] : $Builtin.Int64
+// CHECK: bb2:
+// CHECK: return [[B]] : $Builtin.Int64
+// CHECK: } // end sil function 'region_branch_rewrite_fallback'
+sil @region_branch_rewrite_fallback : $@convention(thin) (Builtin.Int1, Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
+bb0(%condition : $Builtin.Int1, %first : $Builtin.Int64, %second : $Builtin.Int64):
+  %one = integer_literal $Builtin.Int1, -1
+  %inverted = builtin "xor_Int1"(%condition : $Builtin.Int1, %one : $Builtin.Int1) : $Builtin.Int1
+  cond_br %inverted, bb1, bb2
+
+bb1:
+  return %first : $Builtin.Int64
+
+bb2:
+  return %second : $Builtin.Int64
+}
+
+// A read-only visit to a call need not invalidate a disjoint pure-SSA region.
+// It must preserve the call even though its result is unused.
+// CHECK-LABEL: sil @region_preserved_call
+// CHECK: bb0([[INPUT:%.*]] : $Builtin.Int64):
+// CHECK-NOT: tuple
+// CHECK: [[TOUCH:%.*]] = function_ref @region_touch
+// CHECK: apply [[TOUCH]]()
+// CHECK: return [[INPUT]] : $Builtin.Int64
+// CHECK: } // end sil function 'region_preserved_call'
+sil @region_preserved_call : $@convention(thin) (Builtin.Int64) -> Builtin.Int64 {
+bb0(%value : $Builtin.Int64):
+  %unused = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  %touch = function_ref @region_touch : $@convention(thin) () -> ()
+  %void = apply %touch() : $@convention(thin) () -> ()
+  return %value : $Builtin.Int64
+}
+
+// This builtin visitor changes SIL outside the initial audited literal/tuple
+// mutation set. It must not be mistaken for a covered edit merely because an
+// earlier instruction already set the iteration's MadeChange flag.
+// REGION-LABEL: silcombine-regions function=region_unknown_visitor_fallback
+// REGION-SAME: full_seeds={{([2-9]|[1-9][0-9]+)}} regional_seeds=0
+// CHECK-LABEL: sil @region_unknown_visitor_fallback
+// CHECK-NOT: builtin "xor_Int64"
+// CHECK: [[ZERO:%.*]] = integer_literal $Builtin.Int64, 0
+// CHECK: return [[ZERO]] : $Builtin.Int64
+// CHECK: } // end sil function 'region_unknown_visitor_fallback'
+sil @region_unknown_visitor_fallback : $@convention(thin) (Builtin.Int64) -> Builtin.Int64 {
+bb0(%value : $Builtin.Int64):
+  %unused = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  %same = builtin "xor_Int64"(%value : $Builtin.Int64, %value : $Builtin.Int64) : $Builtin.Int64
+  return %same : $Builtin.Int64
+}
+
+// Sinking/cloning an owned forwarding instruction and canonicalizing its
+// lifetime can affect multiple blocks and must remain a full-scan fallback.
+// The owned result and the call on the other path must both survive.
+// REGION-LABEL: silcombine-regions function=region_owned_forwarding_fallback
+// REGION-SAME: full_seeds={{([2-9]|[1-9][0-9]+)}} regional_seeds=0
+// CHECK-LABEL: sil [ossa] @region_owned_forwarding_fallback
+// CHECK: bb0([[OBJECT:%.*]] : @owned $RegionLeaf,
+// CHECK: cond_br undef, bb1, bb2
+// CHECK: bb1:
+// CHECK: [[RETURNED:%.*]] = upcast [[OBJECT]] : $RegionLeaf to $RegionBase
+// CHECK: br bb3([[RETURNED]] : $RegionBase)
+// CHECK: bb2:
+// CHECK: [[CALLED:%.*]] = upcast [[OBJECT]] : $RegionLeaf to $RegionMiddle
+// CHECK: apply {{%.*}}([[CALLED]])
+// CHECK: bb3([[RESULT:%.*]] : @owned $RegionBase):
+// CHECK: return [[RESULT]] : $RegionBase
+// CHECK: } // end sil function 'region_owned_forwarding_fallback'
+sil [ossa] @region_owned_forwarding_fallback : $@convention(thin) (@owned RegionLeaf, @guaranteed RegionBase) -> @owned RegionBase {
+bb0(%object : @owned $RegionLeaf, %alternative : @guaranteed $RegionBase):
+  %middle = upcast %object : $RegionLeaf to $RegionMiddle
+  cond_br undef, bb1, bb2
+
+bb1:
+  %base = upcast %middle : $RegionMiddle to $RegionBase
+  br bb3(%base : $RegionBase)
+
+bb2:
+  %copy = copy_value %alternative : $RegionBase
+  %use = function_ref @region_use_owned_middle : $@convention(thin) (@owned RegionMiddle) -> ()
+  %void = apply %use(%middle) : $@convention(thin) (@owned RegionMiddle) -> ()
+  br bb3(%copy : $RegionBase)
+
+bb3(%result : @owned $RegionBase):
+  return %result : $RegionBase
+}
