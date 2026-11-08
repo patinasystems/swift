@@ -8,6 +8,7 @@
 // RUN: %FileCheck %s --check-prefix=BARRIER < %t/barrier.log
 // RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions -sil-combine -dce -common-subexpression-elimination -sil-combine %s > %t/pre-cse.sil 2> %t/pre-cse.log
 // RUN: %FileCheck %s --check-prefix=PRE-CSE < %t/pre-cse.log
+// RUN: %FileCheck %s --check-prefix=PRE-IR < %t/pre-cse.sil
 
 sil_stage canonical
 
@@ -71,6 +72,10 @@ bb3(%result : $(Builtin.Int64, Builtin.Int64)):
 // PRE-CSE-SAME: cross_pass_seeds=0
 // PRE-CSE: silcombine-regions function=cross_pass_pre_cse_dce_change
 // PRE-CSE-SAME: cross_pass_seeds=0
+// PRE-IR-LABEL: sil @cross_pass_pre_cse_dce_change
+// PRE-IR-NOT: cond_br
+// PRE-IR: return
+// PRE-IR-NEXT: } // end sil function 'cross_pass_pre_cse_dce_change'
 // CHECK-LABEL: sil @cross_pass_pre_cse_dce_change
 // CHECK: [[SUM:%.*]] = builtin "add_Int64"
 // CHECK-NOT: builtin "add_Int64"
