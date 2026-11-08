@@ -6,6 +6,8 @@
 // RUN: %FileCheck %s --check-prefix=CROSS < %t/regions.log
 // RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions -sil-combine -common-subexpression-elimination -dce -sil-combine %s > %t/barrier.sil 2> %t/barrier.log
 // RUN: %FileCheck %s --check-prefix=BARRIER < %t/barrier.log
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions -sil-combine -dce -common-subexpression-elimination -sil-combine %s > %t/pre-cse.sil 2> %t/pre-cse.log
+// RUN: %FileCheck %s --check-prefix=PRE-CSE < %t/pre-cse.log
 
 sil_stage canonical
 
@@ -24,13 +26,18 @@ sil @cross_region_use_objects : $@convention(thin) (@guaranteed CrossRegionBase,
 // CROSS-SAME: cross_pass_seeds=0
 // CROSS: silcombine-regions function=cross_pass_pure_duplicate
 // CROSS-SAME: cross_pass_seeds=1
-// An unaudited intervening pass is a barrier even when it makes no changes.
-// This protects same-function metadata/context changes without assuming every
-// legacy pass sends a precise mutation notification.
+// An unaudited pass AFTER CSE is a barrier even when it makes no changes:
+// CSE invalidated the native completion certificate for that dirty handoff.
 // BARRIER-LABEL: silcombine-regions function=cross_pass_pure_duplicate
 // BARRIER-SAME: cross_pass_seeds=0
 // BARRIER: silcombine-regions function=cross_pass_pure_duplicate
 // BARRIER-SAME: cross_pass_seeds=0
+// Before CSE, no-op DCE leaves the native completed-SILCombine bit intact.
+// It may preserve the empty saturation certificate, not a dirty region.
+// PRE-CSE-LABEL: silcombine-regions function=cross_pass_pure_duplicate
+// PRE-CSE-SAME: cross_pass_seeds=0
+// PRE-CSE: silcombine-regions function=cross_pass_pure_duplicate
+// PRE-CSE-SAME: cross_pass_seeds=1
 // CHECK-LABEL: sil @cross_pass_pure_duplicate
 // CHECK: [[SUM:%.*]] = builtin "add_Int64"
 // CHECK-NOT: builtin "add_Int64"
@@ -55,6 +62,36 @@ bb2:
 
 bb3(%result : $(Builtin.Int64, Builtin.Int64)):
   return %result : $(Builtin.Int64, Builtin.Int64)
+}
+
+// The first SILCombine leaves a useless control-flow diamond intact. Standalone
+// DCE removes that diamond before CSE and invalidates the native completion
+// bit. CSE must therefore NOT reuse the earlier saturation certificate.
+// PRE-CSE-LABEL: silcombine-regions function=cross_pass_pre_cse_dce_change
+// PRE-CSE-SAME: cross_pass_seeds=0
+// PRE-CSE: silcombine-regions function=cross_pass_pre_cse_dce_change
+// PRE-CSE-SAME: cross_pass_seeds=0
+// CHECK-LABEL: sil @cross_pass_pre_cse_dce_change
+// CHECK: [[SUM:%.*]] = builtin "add_Int64"
+// CHECK-NOT: builtin "add_Int64"
+// CHECK: [[PAIR:%.*]] = tuple ([[SUM]] : $Builtin.Int64, [[SUM]] : $Builtin.Int64)
+// CHECK: return [[PAIR]] : $(Builtin.Int64, Builtin.Int64)
+// CHECK: } // end sil function 'cross_pass_pre_cse_dce_change'
+sil @cross_pass_pre_cse_dce_change : $@convention(thin) (Builtin.Int64, Builtin.Int64, Builtin.Int1) -> (Builtin.Int64, Builtin.Int64) {
+bb0(%left : $Builtin.Int64, %right : $Builtin.Int64, %condition : $Builtin.Int1):
+  %sum = builtin "add_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int64
+  cond_br %condition, bb1, bb2
+
+bb1:
+  br bb3
+
+bb2:
+  br bb3
+
+bb3:
+  %duplicate = builtin "add_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int64
+  %pair = tuple (%sum : $Builtin.Int64, %duplicate : $Builtin.Int64)
+  return %pair : $(Builtin.Int64, Builtin.Int64)
 }
 
 // A changed first SILCombine cannot publish the settled no-change baseline
