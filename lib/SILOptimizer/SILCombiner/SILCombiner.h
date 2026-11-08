@@ -37,6 +37,7 @@
 #include "swift/SILOptimizer/Utils/CastOptimizer.h"
 #include "swift/SILOptimizer/Utils/Existential.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/InstructionChangeTracker.h"
 #include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -110,6 +111,32 @@ private:
 
   unsigned initialWorklistSize = 0;
 
+  // This record lives only until this invocation's next fixed-point round.
+  // It never reuses analysis answers or instruction pointers across passes.
+  std::unique_ptr<InstructionChangeTracker> changeTracker;
+  unsigned fullWorklistSize = 0;
+  int64_t countChangeAfterSeed = 0;
+  unsigned fullSeeds = 0, regionalSeeds = 0;
+  uint64_t fullSeedInstructions = 0, regionalSeedInstructions = 0;
+  bool lastIterationWasRegional = false;
+  bool aborted = false;
+
+  bool updateFullWorklistSize(int64_t delta) {
+    if (delta < -int64_t(fullWorklistSize) ||
+        delta > int64_t(~0u) - fullWorklistSize) {
+      changeTracker->requireFullScan("instruction-count-range");
+      return false;
+    }
+    fullWorklistSize = unsigned(int64_t(fullWorklistSize) + delta);
+    return true;
+  }
+
+  void trackReplacement(SILValue oldValue, SILValue newValue) {
+    if (changeTracker)
+      for (auto *use : oldValue->getUses())
+        changeTracker->recordOperandChange(use, newValue);
+  }
+
 public:
   /// Builder used to insert instructions.
   SILBuilder Builder;
@@ -130,6 +157,7 @@ private:
 public:
   SILCombiner(SILFunctionTransform *parentTransform,
               bool removeCondFails, bool enableCopyPropagation);
+  ~SILCombiner();
 
   bool runOnFunction(SILFunction &F);
 
@@ -137,6 +165,12 @@ public:
     Iteration = 0;
     Worklist.resetChecked();
     MadeChange = false;
+    fullWorklistSize = fullSeeds = regionalSeeds = 0;
+    fullSeedInstructions = regionalSeedInstructions = 0;
+    countChangeAfterSeed = 0;
+    lastIterationWasRegional = aborted = false;
+    if (changeTracker)
+      changeTracker->reset();
   }
 
   /// A "syntactic" high level function that combines our insertPt with the main
@@ -186,11 +220,14 @@ public:
   // to the worklist, replace all uses of I with the new value, then return I,
   // so that the combiner will know that I was modified.
   void replaceInstUsesWith(SingleValueInstruction &I, ValueBase *V) {
+    trackReplacement(&I, V);
     return Worklist.replaceInstUsesWith(I, V);
   }
 
   /// Perform use->set(value) and add use->user to the worklist.
   void setUseValue(Operand *use, SILValue value) {
+    if (changeTracker)
+      changeTracker->recordOperandChange(use, value);
     use->set(value);
     Worklist.add(use->getUser());
   }
@@ -200,10 +237,13 @@ public:
   // uses of oldValue to the worklist, replace all uses of oldValue
   // with newValue.
   void replaceValueUsesWith(SILValue oldValue, SILValue newValue) {
+    trackReplacement(oldValue, newValue);
     Worklist.replaceValueUsesWith(oldValue, newValue);
   }
 
   void replaceInstUsesPairwiseWith(SILInstruction *oldI, SILInstruction *newI) {
+    for (auto pair : llvm::zip(oldI->getResults(), newI->getResults()))
+      trackReplacement(std::get<0>(pair), std::get<1>(pair));
     Worklist.replaceInstUsesPairwiseWith(oldI, newI);
   }
 
@@ -217,6 +257,15 @@ public:
                                         SILBasicBlock::iterator &InstIter,
                                         bool AddOperandsToWorklist = true,
                                         bool salvageDebugInfo = true) {
+    if (changeTracker)
+      changeTracker->recordDeletion(&I);
+    // Worklist deletion salvages and then erases debug users internally,
+    // without passing their insertion/deletion events through this journal.
+    if (changeTracker)
+      for (auto result : I.getResults())
+        for (auto *use : result->getUses())
+          if (use->getUser()->isDebugInstruction())
+            changeTracker->requireFullScan("debug-salvage");
     Worklist.eraseInstFromFunction(I, InstIter, AddOperandsToWorklist,
                                    salvageDebugInfo);
     MadeChange = true;
@@ -397,7 +446,8 @@ private:
                                               WitnessMethodInst *WMI);
 
   /// Perform one SILCombine iteration.
-  bool doOneIteration(SILFunction &F, unsigned Iteration);
+  bool doOneIteration(SILFunction &F, unsigned Iteration,
+                      bool forceFullScan = false);
 
   void processInstruction(SILInstruction *instruction,
                           SILCombineCanonicalize &scCanonicalize,
@@ -406,7 +456,9 @@ private:
 
   /// Add reachable code to the worklist. Meant to be used when starting to
   /// process a new function.
-  void addReachableCodeToWorklist(SILBasicBlock *BB);
+  void addReachableCodeToWorklist(
+      SILBasicBlock *BB,
+      const llvm::SmallPtrSetImpl<SILBasicBlock *> *dirtyBlocks = nullptr);
 
   typedef SmallVector<SILInstruction*, 4> UserListTy;
 

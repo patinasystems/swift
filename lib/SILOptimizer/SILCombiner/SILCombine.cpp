@@ -45,6 +45,8 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include <cstdlib>
 
 using namespace swift;
 
@@ -62,6 +64,19 @@ static llvm::cl::opt<bool> EnableSILCombineCanonicalize(
     llvm::cl::desc("Canonicalization during sil-combine"), llvm::cl::init(true),
     llvm::cl::Hidden);
 
+static llvm::cl::opt<bool> EnableChangedRegions(
+    "sil-combine-changed-regions", llvm::cl::Hidden,
+    llvm::cl::init([] {
+      auto *value = std::getenv("SWIFT_ENABLE_CHANGED_REGION_REOPT");
+      return value && StringRef(value) == "1";
+    }()));
+static llvm::cl::opt<bool> VerifyChangedRegions(
+    "sil-combine-verify-changed-regions", llvm::cl::Hidden,
+    llvm::cl::init(false));
+static llvm::cl::opt<bool> PrintChangedRegions(
+    "sil-combine-print-changed-regions", llvm::cl::Hidden,
+    llvm::cl::init(false));
+
 //===----------------------------------------------------------------------===//
 //                              Utility Methods
 //===----------------------------------------------------------------------===//
@@ -73,34 +88,33 @@ static llvm::cl::opt<bool> EnableSILCombineCanonicalize(
 /// particular, we DCE instructions as we go, to avoid adding them to the
 /// worklist (this significantly speeds up SILCombine on code where many
 /// instructions are dead or constant).
-void SILCombiner::addReachableCodeToWorklist(SILBasicBlock *BB) {
+void SILCombiner::addReachableCodeToWorklist(
+    SILBasicBlock *BB,
+    const llvm::SmallPtrSetImpl<SILBasicBlock *> *dirtyBlocks) {
   BasicBlockWorklist Worklist(BB);
   llvm::SmallVector<SILInstruction *, 16> InstrsForSILCombineWorklist;
 
   while (SILBasicBlock *BB = Worklist.pop()) {
-    for (SILBasicBlock::iterator BBI = BB->begin(), E = BB->end(); BBI != E; ) {
-      SILInstruction *Inst = &*BBI;
-      ++BBI;
+    // Still traverse clean blocks: selected blocks must retain the original
+    // reachable DFS/top-down ordering, independent of notification order.
+    if (!dirtyBlocks || dirtyBlocks->contains(BB)) {
+      for (SILBasicBlock::iterator BBI = BB->begin(), E = BB->end(); BBI != E; ) {
+        SILInstruction *Inst = &*BBI;
+        ++BBI;
 
-      // DCE instruction if trivially dead.
-      if (isInstructionTriviallyDead(Inst)) {
-        ++NumDeadInst;
-        LLVM_DEBUG(llvm::dbgs() << "SC: DCE: " << *Inst << '\n');
+        // DCE instruction if trivially dead.
+        if (isInstructionTriviallyDead(Inst)) {
+          ++NumDeadInst;
+          LLVM_DEBUG(llvm::dbgs() << "SC: DCE: " << *Inst << '\n');
 
-        // We pass in false here since we need to signal to
-        // eraseInstFromFunction to not add this instruction's operands to the
-        // worklist since we have not initialized the worklist yet.
-        //
-        // The reason to just use a default argument here is that it allows us
-        // to centralize all instruction removal in SILCombine into this one
-        // function. This is important if we want to be able to update analyses
-        // in a clean manner.
-        eraseInstFromFunction(*Inst, BBI,
-                              false /*Don't add operands to worklist*/);
-        continue;
+          // We pass in false here since the worklist is not initialized yet.
+          eraseInstFromFunction(*Inst, BBI,
+                                false /*Don't add operands to worklist*/);
+          continue;
+        }
+
+        InstrsForSILCombineWorklist.push_back(Inst);
       }
-
-      InstrsForSILCombineWorklist.push_back(Inst);
     }
 
     // Recursively visit successors.
@@ -126,15 +140,28 @@ namespace swift {
 // Define a CanonicalizeInstruction subclass for use in SILCombine.
 class SILCombineCanonicalize final : CanonicalizeInstruction {
   SmallSILInstructionWorklist<256> &Worklist;
+  InstructionChangeTracker *changeTracker;
   bool changed = false;
 
 public:
   SILCombineCanonicalize(SmallSILInstructionWorklist<256> &Worklist,
-                         DeadEndBlocks &deadEndBlocks)
-      : CanonicalizeInstruction(DEBUG_TYPE, deadEndBlocks), Worklist(Worklist) {
+                         DeadEndBlocks &deadEndBlocks,
+                         InstructionChangeTracker *tracker = nullptr)
+      : CanonicalizeInstruction(DEBUG_TYPE, deadEndBlocks), Worklist(Worklist),
+        changeTracker(tracker) {
+    // Keep the precise pre-set callback separate from notifyHasNewUsers,
+    // which also has callers that perform raw RAUW without an old-use event.
+    callbacks = callbacks.onSetUseValue([&](Operand *use, SILValue newValue) {
+      use->set(newValue);
+      if (Worklist.size() < 10000)
+        Worklist.addUsersToWorklist(newValue);
+      changed = true;
+    }).withChangeTracker(tracker);
   }
 
   void notifyNewInstruction(SILInstruction *inst) override {
+    if (changeTracker)
+      changeTracker->recordInsertion(inst);
     Worklist.add(inst);
     Worklist.addUsersOfAllResultsToWorklist(inst);
     changed = true;
@@ -143,12 +170,16 @@ public:
   // Just delete the given 'inst' and record its operands. The callback isn't
   // allowed to mutate any other instructions.
   void killInstruction(SILInstruction *inst) override {
+    if (changeTracker)
+      changeTracker->recordDeletion(inst);
     Worklist.eraseSingleInstFromFunction(*inst,
                                          /*AddOperandsToWorklist*/ true);
     changed = true;
   }
 
   void notifyHasNewUsers(SILValue value) override {
+    if (changeTracker)
+      changeTracker->requireFullScan("untracked-canonicalizer-rauw");
     if (Worklist.size() < 10000) {
       Worklist.addUsersToWorklist(value);
     }
@@ -216,7 +247,21 @@ SILCombiner::SILCombiner(SILFunctionTransform *trans,
       [&](SILInstruction *I) { eraseInstFromFunction(*I); }),
   deBlocks(trans->getFunction()),
   ownershipFixupContext(getInstModCallbacks(), deBlocks) {
-  trans->getPassManager()->getSwiftPassInvocation()->getCurrent()->injectSILCombiner(this);
+  auto *invocation =
+      trans->getPassManager()->getSwiftPassInvocation()->getCurrent();
+  invocation->injectSILCombiner(this);
+  if (EnableChangedRegions) {
+    changeTracker = std::make_unique<InstructionChangeTracker>(*trans->getFunction());
+    deleter.getCallbacks() =
+        deleter.getCallbacks().withChangeTracker(changeTracker.get());
+    invocation->setInstructionChangeTracker(changeTracker.get());
+  }
+}
+
+SILCombiner::~SILCombiner() {
+  if (changeTracker)
+    parentTransform->getPassManager()->getSwiftPassInvocation()->getCurrent()
+        ->setInstructionChangeTracker(nullptr);
 }
 
 bool SILCombiner::trySinkOwnedForwardingInst(SingleValueInstruction *svi) {
@@ -354,6 +399,8 @@ void SILCombiner::canonicalizeOSSALifetimes(SILInstruction *currentInst) {
   }
   if (defsToCanonicalize.empty())
     return;
+  if (changeTracker)
+    changeTracker->requireFullScan("ownership-lifetimes");
 
   // Remove instructions deleted during canonicalization from SILCombine's
   // worklist. OSSACanonicalizeOwned invalidates operands before invoking
@@ -403,18 +450,70 @@ void SILCombiner::canonicalizeOSSALifetimes(SILInstruction *currentInst) {
   }
 }
 
-bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
+bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration,
+                                 bool forceFullScan) {
   MadeChange = false;
 
   LLVM_DEBUG(llvm::dbgs() << "\n\nSILCOMBINE ITERATION #" << Iteration << " on "
                           << F.getName() << "\n");
 
-  // Add reachable instructions to our worklist.
-  addReachableCodeToWorklist(&*F.begin());
+  llvm::SmallPtrSet<SILBasicBlock *, 16> dirtyBlocks;
+  // Keep regional worklists well below notifyHasNewUsers' 10000-entry
+  // profitability cap, even with the journal's bounded insertion/deletion
+  // events. Changing that cap's outcome could change optimization quality.
+  if (changeTracker && fullWorklistSize >= 8192)
+    changeTracker->requireFullScan("worklist-size-limit");
+  lastIterationWasRegional = changeTracker && Iteration && !forceFullScan &&
+      !changeTracker->requiresFullScan() && !changeTracker->getDirtyBlocks().empty();
+  const char *fallback = changeTracker && changeTracker->requiresFullScan()
+                             ? changeTracker->getFallbackReason() : "none";
+  if (lastIterationWasRegional) {
+    dirtyBlocks.insert(changeTracker->getDirtyBlocks().begin(),
+                       changeTracker->getDirtyBlocks().end());
+    if (!updateFullWorklistSize(changeTracker->getInstructionCountChange() -
+                               countChangeAfterSeed))
+      lastIterationWasRegional = false;
+  }
+  if (changeTracker)
+    changeTracker->reset();
 
-  SILCombineCanonicalize scCanonicalize(Worklist, *DEBA->get(&F));
+  addReachableCodeToWorklist(&*F.begin(),
+                             lastIterationWasRegional ? &dirtyBlocks : nullptr);
 
-  initialWorklistSize = Worklist.size();
+  // If seeding itself encountered an untracked utility or lost count
+  // coverage, rebuild the original complete seed before running transforms.
+  // Never let an unknown count change the original profitability thresholds.
+  if (lastIterationWasRegional &&
+      (changeTracker->requiresFullScan() ||
+       !updateFullWorklistSize(changeTracker->getInstructionCountChange()))) {
+    while (!Worklist.isEmpty())
+      Worklist.pop_back_val();
+    Worklist.resetChecked();
+    lastIterationWasRegional = false;
+    addReachableCodeToWorklist(&*F.begin());
+  }
+
+  if (lastIterationWasRegional) {
+    ++regionalSeeds;
+    regionalSeedInstructions += Worklist.size();
+  } else {
+    ++fullSeeds;
+    fullSeedInstructions += Worklist.size();
+    fullWorklistSize = Worklist.size();
+  }
+  // Retain the original whole-function ownership complexity threshold even
+  // when only a subset of instructions was seeded into this round.
+  initialWorklistSize = fullWorklistSize;
+  countChangeAfterSeed = changeTracker && !changeTracker->requiresFullScan()
+                            ? changeTracker->getInstructionCountChange() : 0;
+  if (PrintChangedRegions)
+    llvm::errs() << "silcombine-region-round function=" << F.getName()
+                 << " regional=" << lastIterationWasRegional
+                 << " instructions=" << Worklist.size()
+                 << " fallback=" << fallback << '\n';
+
+  SILCombineCanonicalize scCanonicalize(Worklist, *DEBA->get(&F),
+                                        changeTracker.get());
 
   // Process until we run out of items in our worklist.
   while (!Worklist.isEmpty()) {
@@ -428,10 +527,19 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
     if (I == nullptr)
       continue;
 
-    if (!parentTransform->continueWithNextSubpassRun(I))
+    if (!parentTransform->continueWithNextSubpassRun(I)) {
+      aborted = true;
+      lastIterationWasRegional = false;
       return false;
+    }
 
+    // Visitor helpers report changes through this field as well as the
+    // reference passed to processInstruction. Do not let an earlier mutation
+    // hide whether this particular visit changed an unsupported instruction.
+    bool earlierChange = MadeChange;
+    MadeChange = false;
     processInstruction(I, scCanonicalize, MadeChange);
+    MadeChange |= earlierChange;
   }
 
   Worklist.resetChecked();
@@ -500,7 +608,10 @@ void SILCombiner::processInstruction(SILInstruction *I,
           // Try to sink the value. If we sank the value and deleted it,
           // return. If we didn't optimize or sank but we are still able to
           // optimize further, we fall through to SILCombine below.
-          if (trySinkOwnedForwardingInst(svi)) {
+          bool sunk = trySinkOwnedForwardingInst(svi);
+          if (changeTracker && MadeChange)
+            changeTracker->requireFullScan("ownership-sinking");
+          if (sunk) {
             return;
           }
         }
@@ -512,8 +623,29 @@ void SILCombiner::processInstruction(SILInstruction *I,
   Builder.setInsertionPoint(I);
 
   SILInstruction *currentInst = I;
-  if (SILInstruction *Result = visit(I)) {
+  auto mutationCount = changeTracker ? changeTracker->getMutationCount() : 0;
+  // The legacy tuple-extract visitor only inserts a literal replacement.
+  // Other C++ visitors can mutate raw operands or global/ownership state:
+  // their existing return/MadeChange contract, together with recorded events,
+  // is a coverage gate, not an assumption that all setters are observed.
+  bool auditedVisitor = isa<TupleExtractInst>(I);
+  SILInstruction *Result = visit(I);
+  if (changeTracker && !auditedVisitor &&
+      (Result || MadeChange ||
+       changeTracker->getMutationCount() != mutationCount))
+    changeTracker->requireFullScan("unaudited-visitor");
+  if (Result) {
     ++NumCombined;
+    if (changeTracker) {
+      if (Result == I) {
+        changeTracker->requireFullScan("in-place-visitor");
+      } else {
+        for (auto pair : llvm::zip(I->getResults(), Result->getResults()))
+          trackReplacement(std::get<0>(pair), std::get<1>(pair));
+        changeTracker->recordInsertion(Result);
+        changeTracker->recordDeletion(I);
+      }
+    }
     // Should we replace the old instruction with a new one?
     Worklist.replaceInstructionWithInstruction(I, Result
 #ifndef NDEBUG
@@ -535,6 +667,8 @@ void SILCombiner::processInstruction(SILInstruction *I,
   // said list in preparation for the next iteration.
   for (SILInstruction *I : *Builder.getTrackingList()) {
     if (!I->isDeleted()) {
+      if (changeTracker)
+        changeTracker->recordInsertion(I);
       LLVM_DEBUG(llvm::dbgs()
                  << "SC: add " << *I << " from tracking list to worklist\n");
       Worklist.add(I);
@@ -602,10 +736,34 @@ bool SILCombiner::runOnFunction(SILFunction &F) {
 
   bool Changed = false;
   // Perform iterations until we do not make any changes.
-  while (doOneIteration(F, Iteration)) {
-    Changed = true;
+  while (true) {
+    bool iterationChanged = doOneIteration(F, Iteration);
+    Changed |= iterationChanged;
+    // A previously safe region can invoke a utility whose mutation scope is
+    // unknown. Confirm saturation with the original full scan in that case.
+    if (!iterationChanged &&
+        !(lastIterationWasRegional && changeTracker->requiresFullScan()))
+      break;
     ++Iteration;
   }
+
+  // The wrapper's stack/phi/lifetime repairs are deliberately outside this
+  // check: they are also outside the original combiner's fixed-point loop.
+  if (VerifyChangedRegions && changeTracker && regionalSeeds && !aborted &&
+      doOneIteration(F, ++Iteration, /*forceFullScan=*/true)) {
+    llvm::errs() << "SILCombine changed-region saturation failed in "
+                 << F.getName() << '\n';
+    llvm::report_fatal_error("changed-region SILCombine missed a transformation");
+  }
+  if (PrintChangedRegions)
+    llvm::errs() << "silcombine-regions function=" << F.getName()
+                 << " full_seeds=" << fullSeeds
+                 << " regional_seeds=" << regionalSeeds
+                 << " full_instructions=" << fullSeedInstructions
+                 << " regional_instructions=" << regionalSeedInstructions
+                 << " fallback="
+                 << (changeTracker && changeTracker->requiresFullScan()
+                         ? changeTracker->getFallbackReason() : "none") << '\n';
 
   if (invalidatedStackNesting) {
     StackNesting::fixNesting(&F);
