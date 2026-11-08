@@ -22,7 +22,8 @@ sil @region_touch : $@convention(thin) () -> ()
 
 // The positive region case needs no operand mutation of a terminator and no
 // Swift instruction helper: initial DCE deletes the unused extract, then the
-// worklist deletes its now-dead tuple producer. Only bb1 needs another sweep.
+// worklist deletes its now-dead tuple producer. The unchanged entry and shared
+// exit remain outside that local edit, even if sibling argument uses are dirtied.
 // REGION-LABEL: silcombine-regions function=region_dead_producer_subset
 // REGION-SAME: full_seeds={{[1-9][0-9]*}} regional_seeds={{[1-9][0-9]*}}
 // CHECK-LABEL: sil @region_dead_producer_subset
@@ -30,9 +31,11 @@ sil @region_touch : $@convention(thin) () -> ()
 // CHECK: cond_br [[CONDITION]], bb1, bb2
 // CHECK: bb1:
 // CHECK-NOT: tuple
-// CHECK: return [[VALUE]] : $Builtin.Int64
+// CHECK: br bb3([[VALUE]] : $Builtin.Int64)
 // CHECK: bb2:
-// CHECK: return [[VALUE]] : $Builtin.Int64
+// CHECK: br bb3([[VALUE]] : $Builtin.Int64)
+// CHECK: bb3([[EXIT:%.*]] : $Builtin.Int64):
+// CHECK: return [[EXIT]] : $Builtin.Int64
 // CHECK: } // end sil function 'region_dead_producer_subset'
 sil @region_dead_producer_subset : $@convention(thin) (Builtin.Int1, Builtin.Int64) -> Builtin.Int64 {
 bb0(%condition : $Builtin.Int1, %value : $Builtin.Int64):
@@ -41,23 +44,28 @@ bb0(%condition : $Builtin.Int1, %value : $Builtin.Int64):
 bb1:
   %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
   %unused = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
-  return %value : $Builtin.Int64
+  br bb3(%value : $Builtin.Int64)
 
 bb2:
-  return %value : $Builtin.Int64
+  br bb3(%value : $Builtin.Int64)
+
+bb3(%exitValue : $Builtin.Int64):
+  return %exitValue : $Builtin.Int64
 }
 
 // A local RAUW replaces the projection with an argument, not a newly inserted
 // instruction. The first prototype may conservatively fall back because the
-// replaced use is a return operand; it must still preserve both path results.
+// replaced use is a branch argument; it must still preserve both path results.
 // CHECK-LABEL: sil @region_tuple_argument_replacement
 // CHECK: bb0([[COND:%.*]] : $Builtin.Int1, [[LEFT:%.*]] : $Builtin.Int64, [[RIGHT:%.*]] : $Builtin.Int64):
 // CHECK: cond_br [[COND]], bb1, bb2
 // CHECK: bb1:
 // CHECK-NOT: tuple
-// CHECK: return [[LEFT]] : $Builtin.Int64
+// CHECK: br bb3([[LEFT]] : $Builtin.Int64)
 // CHECK: bb2:
-// CHECK: return [[RIGHT]] : $Builtin.Int64
+// CHECK: br bb3([[RIGHT]] : $Builtin.Int64)
+// CHECK: bb3([[EXIT:%.*]] : $Builtin.Int64):
+// CHECK: return [[EXIT]] : $Builtin.Int64
 // CHECK: } // end sil function 'region_tuple_argument_replacement'
 sil @region_tuple_argument_replacement : $@convention(thin) (Builtin.Int1, Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
 bb0(%condition : $Builtin.Int1, %left : $Builtin.Int64, %right : $Builtin.Int64):
@@ -66,10 +74,13 @@ bb0(%condition : $Builtin.Int1, %left : $Builtin.Int64, %right : $Builtin.Int64)
 bb1:
   %pair = tuple (%left : $Builtin.Int64, %right : $Builtin.Int64)
   %result = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
-  return %result : $Builtin.Int64
+  br bb3(%result : $Builtin.Int64)
 
 bb2:
-  return %right : $Builtin.Int64
+  br bb3(%right : $Builtin.Int64)
+
+bb3(%exitValue : $Builtin.Int64):
+  return %exitValue : $Builtin.Int64
 }
 
 // Both projections become the same value. Folding the comparison then kills
@@ -103,10 +114,12 @@ bb1:
 // CHECK: cond_br [[C]], bb2, bb1
 // CHECK: bb1:
 // CHECK-NOT: tuple
-// CHECK: return [[Y]] : $Builtin.Int64
+// CHECK: br bb3([[Y]] : $Builtin.Int64)
 // CHECK: bb2:
 // CHECK-NOT: tuple
-// CHECK: return [[X]] : $Builtin.Int64
+// CHECK: br bb3([[X]] : $Builtin.Int64)
+// CHECK: bb3([[EXIT:%.*]] : $Builtin.Int64):
+// CHECK: return [[EXIT]] : $Builtin.Int64
 // CHECK: } // end sil function 'region_nontextual_successor_uses'
 sil @region_nontextual_successor_uses : $@convention(thin) (Builtin.Int1, Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
 bb0(%condition : $Builtin.Int1, %left : $Builtin.Int64, %right : $Builtin.Int64):
@@ -115,11 +128,14 @@ bb0(%condition : $Builtin.Int1, %left : $Builtin.Int64, %right : $Builtin.Int64)
 
 bb1:
   %rightResult = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 1
-  return %rightResult : $Builtin.Int64
+  br bb3(%rightResult : $Builtin.Int64)
 
 bb2:
   %leftResult = tuple_extract %pair : $(Builtin.Int64, Builtin.Int64), 0
-  return %leftResult : $Builtin.Int64
+  br bb3(%leftResult : $Builtin.Int64)
+
+bb3(%exitValue : $Builtin.Int64):
+  return %exitValue : $Builtin.Int64
 }
 
 // Replacing a branch changes CFG instruction identity even when dominance and
@@ -131,9 +147,11 @@ bb2:
 // CHECK-NOT: builtin "xor_Int1"
 // CHECK: cond_br [[INPUT]], bb2, bb1
 // CHECK: bb1:
-// CHECK: return [[A]] : $Builtin.Int64
+// CHECK: br bb3([[A]] : $Builtin.Int64)
 // CHECK: bb2:
-// CHECK: return [[B]] : $Builtin.Int64
+// CHECK: br bb3([[B]] : $Builtin.Int64)
+// CHECK: bb3([[EXIT:%.*]] : $Builtin.Int64):
+// CHECK: return [[EXIT]] : $Builtin.Int64
 // CHECK: } // end sil function 'region_branch_rewrite_fallback'
 sil @region_branch_rewrite_fallback : $@convention(thin) (Builtin.Int1, Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
 bb0(%condition : $Builtin.Int1, %first : $Builtin.Int64, %second : $Builtin.Int64):
@@ -142,10 +160,13 @@ bb0(%condition : $Builtin.Int1, %first : $Builtin.Int64, %second : $Builtin.Int6
   cond_br %inverted, bb1, bb2
 
 bb1:
-  return %first : $Builtin.Int64
+  br bb3(%first : $Builtin.Int64)
 
 bb2:
-  return %second : $Builtin.Int64
+  br bb3(%second : $Builtin.Int64)
+
+bb3(%exitValue : $Builtin.Int64):
+  return %exitValue : $Builtin.Int64
 }
 
 // A read-only visit to a call need not invalidate a disjoint pure-SSA region.
