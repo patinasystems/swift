@@ -1,7 +1,7 @@
 // RUN: %empty-directory(%t)
 // RUN: %gyb %s > %t/active-roots.sil
-// RUN: %target-sil-opt -enable-sil-verify-all -retain-sinking -late-release-hoisting %t/active-roots.sil | %FileCheck --check-prefixes=CHECK,LATE %t/active-roots.sil
-// RUN: %target-sil-opt -enable-sil-verify-all -release-hoisting %t/active-roots.sil | %FileCheck --check-prefixes=CHECK,FROZEN %t/active-roots.sil
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -retain-sinking -late-release-hoisting %t/active-roots.sil | %FileCheck --check-prefixes=CHECK,LATE %t/active-roots.sil
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -release-hoisting %t/active-roots.sil | %FileCheck --check-prefixes=CHECK,FROZEN %t/active-roots.sil
 
 import Builtin
 
