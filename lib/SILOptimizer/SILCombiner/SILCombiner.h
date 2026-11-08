@@ -42,6 +42,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include <optional>
 
 namespace swift {
 
@@ -113,13 +114,17 @@ private:
 
   // This record lives only until this invocation's next fixed-point round.
   // It never reuses analysis answers or instruction pointers across passes.
-  std::unique_ptr<InstructionChangeTracker> changeTracker;
+  std::optional<InstructionChangeTracker> changeTracker;
   unsigned fullWorklistSize = 0;
   int64_t countChangeAfterSeed = 0;
   unsigned fullSeeds = 0, regionalSeeds = 0;
   uint64_t fullSeedInstructions = 0, regionalSeedInstructions = 0;
   bool lastIterationWasRegional = false;
   bool aborted = false;
+
+  InstructionChangeTracker *getChangeTracker() {
+    return changeTracker ? &*changeTracker : nullptr;
+  }
 
   bool updateFullWorklistSize(int64_t delta) {
     if (delta < -int64_t(fullWorklistSize) ||

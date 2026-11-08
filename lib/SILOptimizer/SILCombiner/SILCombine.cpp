@@ -251,10 +251,10 @@ SILCombiner::SILCombiner(SILFunctionTransform *trans,
       trans->getPassManager()->getSwiftPassInvocation()->getCurrent();
   invocation->injectSILCombiner(this);
   if (EnableChangedRegions) {
-    changeTracker = std::make_unique<InstructionChangeTracker>(*trans->getFunction());
+    changeTracker.emplace(*trans->getFunction());
     deleter.getCallbacks() =
-        deleter.getCallbacks().withChangeTracker(changeTracker.get());
-    invocation->setInstructionChangeTracker(changeTracker.get());
+        deleter.getCallbacks().withChangeTracker(getChangeTracker());
+    invocation->setInstructionChangeTracker(getChangeTracker());
   }
 }
 
@@ -513,7 +513,7 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration,
                  << " fallback=" << fallback << '\n';
 
   SILCombineCanonicalize scCanonicalize(Worklist, *DEBA->get(&F),
-                                        changeTracker.get());
+                                        getChangeTracker());
 
   // Process until we run out of items in our worklist.
   while (!Worklist.isEmpty()) {
