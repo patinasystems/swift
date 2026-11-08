@@ -3,7 +3,7 @@
 This branch starts with measurement. The compiler algorithm is unchanged until
 the unmodified source build and application replay baselines pass.
 
-`dependencies.json` pins upstream Swift and the three dependencies needed for a
+`dependencies.json` pins upstream Swift and the four dependencies needed for a
 macOS compiler build. The benchmark tools require Python 3 and its standard
 library. In Kitchen, invoke Python with `uv` and run compiler work through Pat.
 
@@ -27,7 +27,8 @@ source as a reduced test without reviewing it first.
 ## Build the compiler
 
 Use Swift's `utils/update-checkout` to obtain sibling `llvm-project`,
-`swift-syntax`, and `cmark` checkouts, then check out the exact commits from
+`swift-syntax`, `swift-experimental-string-processing`, and `cmark` checkouts,
+then check out the exact commits from
 `dependencies.json`. Skip all other repositories and skip updating `swift`
 itself. Cloning with `--skip-history --skip-tags --partial-clone` keeps Git data
 small. The build script refuses mismatched or edited dependencies.

@@ -65,7 +65,7 @@ def main():
     developer = Path(output(['xcode-select', '-p']))
     tools = developer / 'Toolchains/XcodeDefault.xctoolchain/usr/bin'
     options = [
-        '--release', '--assertions', '--bootstrapping=hosttools',
+        '--release', '--assertions', '--bootstrapping=hosttools', '--reconfigure',
         '--skip-build-osx', '--skip-build-benchmarks', '--skip-early-swift-driver',
         '--skip-build-compiler-rt', '--skip-build-clang-tools-extra', '--skip-build-lld',
         '--build-embedded-stdlib=false',
@@ -73,6 +73,7 @@ def main():
         '--llvm-targets-to-build=AArch64', '--enable-new-runtime-build=false',
         '--native-swift-tools-path=' + str(tools), '--no-swift-pedantic-diagnostics',
         '--extra-swift-cmake-options=-DSWIFT_APPEND_VC_REV=OFF',
+        '--extra-swift-cmake-options=-DSWIFT_BUILD_REGEX_PARSER_IN_COMPILER=ON',
         '--build-subdir=patina-solver', '--jobs=' + str(args.jobs),
     ]
     destination = Path(args.out).resolve()
