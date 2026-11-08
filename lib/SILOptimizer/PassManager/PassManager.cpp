@@ -27,6 +27,7 @@
 #include "swift/SILOptimizer/Analysis/FunctionOrder.h"
 #include "swift/SILOptimizer/PassManager/PrettyStackTrace.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/InstructionChangeTracker.h"
 #include "swift/SILOptimizer/Utils/OptimizerStatsUtils.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
@@ -1601,6 +1602,7 @@ void SwiftPassInvocation::startFunctionPassRun(SILFunctionTransform *transform) 
 
 void SwiftPassInvocation::finishedFunctionPassRun() {
   ASSERT(function && transform && "not running a function pass");
+  ASSERT(!instructionChangeTracker && "dirty-region journal outlives its client");
   ASSERT((changeNotifications & SILContext::NotificationKind::FunctionTables) == 0
          && "a function pass must not change function tables");
   ASSERT(!function->needBreakInfiniteLoops() && "didn't break infinite loops");
@@ -1623,9 +1625,19 @@ void SwiftPassInvocation::updateAnalysis() {
 
 void SwiftPassInvocation::startInstructionPassRun(SILInstruction *inst) {
   ASSERT(inst->getFunction() == function && "running instruction pass on wrong function");
+  if (instructionChangeTracker)
+    instructionPassNotificationSerial = getChangeNotificationSerial();
 }
 
 void SwiftPassInvocation::finishedInstructionPassRun() {
+  // Swift instruction helpers currently report some changes only after
+  // replacing operands, and their SILCombine notifier may be empty. Such a
+  // notification cannot establish complete old/new SSA neighborhoods. Keep the
+  // existing full scan until a helper has precise mutation callbacks.
+  if (instructionChangeTracker &&
+      instructionPassNotificationSerial != getChangeNotificationSerial()) {
+    instructionChangeTracker->recordUnknownMutation("Swift instruction mutation");
+  }
   verifyEverythingIsCleared();
 }
 

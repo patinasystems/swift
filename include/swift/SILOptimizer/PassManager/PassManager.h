@@ -39,6 +39,7 @@ class SILOptions;
 class SILTransform;
 class SILPassManager;
 class SILCombiner;
+class InstructionChangeTracker;
 
 namespace irgen {
 class IRGenModule;
@@ -60,6 +61,11 @@ class SwiftPassInvocation : public SILContext {
 
   /// Non-null if this is an instruction simplification, invoked from SILCombine.
   SILCombiner *silCombiner = nullptr;
+
+  /// Non-owning; the optimizing client must unregister before destruction and
+  /// before the pass manager flushes deleted instructions.
+  InstructionChangeTracker *instructionChangeTracker = nullptr;
+  uint64_t instructionPassNotificationSerial = 0;
 
   SwiftPassInvocation *nestedSwiftPassInvocation = nullptr;
 
@@ -95,6 +101,12 @@ public:
 
   void injectSILCombiner(SILCombiner *combiner) {
     silCombiner = combiner;
+  }
+
+  void setInstructionChangeTracker(InstructionChangeTracker *tracker) {
+    instructionChangeTracker = tracker;
+    changeNotificationSerial = tracker ? 1 : 0;
+    instructionPassNotificationSerial = 0;
   }
 
   /// The top-level API to erase an instruction, called from the Swift pass.
