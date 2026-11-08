@@ -747,9 +747,12 @@ static FunctionTest SILCombineVisitInstruction(
 
 bool SILCombiner::runOnFunction(SILFunction &F) {
   clear();
-  if (changeTracker)
-    parentTransform->getPassManager()->takeSILCombineRegion(
-        &F, importedDirtyBlocks, fullWorklistSize);
+  if (changeTracker &&
+      !parentTransform->getPassManager()->takeSILCombineRegion(
+          &F, importedDirtyBlocks, fullWorklistSize)) {
+    importedDirtyBlocks.clear();
+    fullWorklistSize = 0;
+  }
 
   bool Changed = false;
   // Perform iterations until we do not make any changes.
