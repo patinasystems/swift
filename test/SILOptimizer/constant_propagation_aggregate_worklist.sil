@@ -1,5 +1,5 @@
-// RUN: %target-sil-opt -enable-sil-opaque-values -enable-sil-verify-all -diagnostic-constant-propagation %s | %FileCheck %s
-// RUN: %target-sil-opt -enable-sil-opaque-values -enable-sil-verify-all -performance-constant-propagation %s | %FileCheck %s
+// RUN: %target-sil-opt -sil-print-types -enable-sil-opaque-values -enable-sil-verify-all -diagnostic-constant-propagation %s | %FileCheck %s
+// RUN: %target-sil-opt -sil-print-types -enable-sil-opaque-values -enable-sil-verify-all -performance-constant-propagation %s | %FileCheck %s
 
 // Aggregate checked casts are valid in opaque-value Raw SIL.
 sil_stage raw
