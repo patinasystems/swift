@@ -234,8 +234,8 @@ def import_roots(argv, cwd):
     for i, word in enumerate(argv):
         if word in ('-I', '-F', '-Fsystem', '-Isystem', '-prebuilt-module-cache-path', '-resource-dir'):
             roots.add(str(Path(os.path.abspath(Path(cwd) / argv[i + 1]))))
-        elif word.startswith(('-I/', '-F/')):
-            roots.add(word[2:])
+        elif word.startswith(('-I', '-F')) and len(word) > 2:
+            roots.add(str(Path(os.path.abspath(Path(cwd) / word[2:]))))
     return roots
 
 
@@ -283,6 +283,11 @@ def capture(transcript, receipt, modules, destination, sources=(), kind='typeche
                 continue
             if '-sdk' in words and '-explicit-swift-module-map-file' not in words:
                 raise ValueError('SDK job capture requires an explicit Swift module dependency map')
+            if '-sdk' in words and '-disable-implicit-swift-modules' not in words:
+                raise ValueError('SDK job capture requires disabled implicit Swift modules')
+            for i, word in enumerate(words[:-1]):
+                if word in ('-import-objc-header', '-import-pch') and Path(words[i + 1]).suffix.lower() != '.pch':
+                    raise ValueError('Capture requires a precompiled bridging header; raw header dependency closure is unsupported')
             primaries = [words[i + 1] for i, w in enumerate(words[:-1]) if w == '-primary-file']
             for i, word in enumerate(words[:-1]):
                 if word == '-primary-filelist':
@@ -394,9 +399,14 @@ def validate_pair(baseline, candidate, control=False):
 
 def replay_arguments(argv, scratch, outputs=None):
     argv = list(argv)
-    for i, word in enumerate(argv[:-1]):
+    for i, word in enumerate(argv):
         if word in ('-module-cache-path', '-clang-scanner-module-cache-path'):
             argv[i + 1] = str(scratch / 'module-cache')
+        elif word.startswith('-fmodules-cache-path='):
+            argv[i] = '-fmodules-cache-path=' + str(scratch / 'module-cache')
+        elif word == '-fmodules-cache-path':
+            value_index = i + 2 if argv[i + 1] == '-Xcc' else i + 1
+            argv[value_index] = str(scratch / 'module-cache')
     if '-module-cache-path' not in argv:
         argv += ['-module-cache-path', str(scratch / 'module-cache')]
     if outputs:

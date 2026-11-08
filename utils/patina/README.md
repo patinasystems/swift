@@ -84,6 +84,10 @@ executables, and SDK settings. These inputs are content-hashed. It does not copy
 or mutate Pat's source lane or DerivedData. If Pat later reuses that lane and an
 input changes, the capture must be recreated; benchmark runs refuse stale inputs.
 
+SDK captures require disabled implicit Swift modules and an explicit dependency
+map. Bridging headers must already be precompiled: raw headers are rejected
+because this tool does not discover their transitive header dependency closure.
+
 Replay changes `-c` to `-typecheck` and strips output-producing and verbose timing
 flags. Object files, diagnostics files, indexes, and module outputs are never
 written into the captured build. Module caches belong to each benchmark arm.

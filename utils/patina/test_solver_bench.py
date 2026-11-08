@@ -178,6 +178,20 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'membership'):
                 bench.verify_inputs(manifest)
 
+    def test_joined_relative_import_search_roots_resolve_against_cwd(self):
+        self.assertEqual(bench.import_roots(['-Irelative/modules', '-Frelative/frameworks'], '/source'),
+                         {'/source/relative/modules', '/source/relative/frameworks'})
+
+    def test_raw_bridging_headers_are_rejected_without_dependency_closure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'a.swift'
+            source.write_text('let x = 1')
+            (root / 'log').write_text(f'cd {root}\n/tools/swift-frontend -frontend -c '
+                f'-primary-file {source} -module-name Angles -import-objc-header bridge.h\n')
+            with self.assertRaisesRegex(ValueError, 'precompiled bridging header'):
+                bench.capture(root / 'log', root / 'receipt', ['Angles'], root / 'manifest')
+
     def test_filtering_happens_after_response_file_expansion(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -292,6 +306,14 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(original[1], '/lane/cache')
         self.assertEqual(bench.replay_arguments(['-typecheck', 'a.swift'], Path('/scratch'))[-2:],
                          ['-module-cache-path', '/scratch/module-cache'])
+
+    def test_clang_cache_options_are_redirected_in_joined_and_forwarded_forms(self):
+        for args in (['-Xcc', '-fmodules-cache-path=/lane/cache'],
+                     ['-Xcc', '-fmodules-cache-path', '-Xcc', '/lane/cache'],
+                     ['-Xcc', '-fmodules-cache-path', '/lane/cache']):
+            replay = bench.replay_arguments(args, Path('/scratch'))
+            self.assertFalse(any('/lane/cache' in arg for arg in replay))
+            self.assertTrue(any('/scratch/module-cache' in arg for arg in replay))
 
     def test_synthetic_capture_pins_sdk_and_resource_modules(self):
         with tempfile.TemporaryDirectory() as directory:

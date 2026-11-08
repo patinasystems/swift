@@ -59,8 +59,8 @@ def main():
         checkout = root.parent / repo
         if output(['git', 'rev-parse', 'HEAD'], checkout) != revision:
             raise ValueError(f'Dependency revision mismatch: {repo}')
-        if output(['git', 'status', '--porcelain', '--untracked-files=no'], checkout):
-            raise ValueError(f'Dependency has tracked edits: {repo}')
+        if output(['git', 'status', '--porcelain', '--untracked-files=normal'], checkout):
+            raise ValueError(f'Dependency has tracked or untracked edits: {repo}')
     output(['git', 'cat-file', '-e', lock['upstream_revision']], root)
     developer = Path(output(['xcode-select', '-p']))
     tools = developer / 'Toolchains/XcodeDefault.xctoolchain/usr/bin'
