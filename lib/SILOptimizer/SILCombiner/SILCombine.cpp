@@ -463,17 +463,26 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration,
   // events. Changing that cap's outcome could change optimization quality.
   if (changeTracker && fullWorklistSize >= 8192)
     changeTracker->requireFullScan("worklist-size-limit");
-  lastIterationWasRegional = changeTracker && Iteration && !forceFullScan &&
-      !changeTracker->requiresFullScan() && !changeTracker->getDirtyBlocks().empty();
+  bool importedSeed = !Iteration && !importedDirtyBlocks.empty();
+  lastIterationWasRegional = changeTracker && !forceFullScan &&
+      !changeTracker->requiresFullScan() &&
+      (importedSeed || (Iteration && !changeTracker->getDirtyBlocks().empty()));
   const char *fallback = changeTracker && changeTracker->requiresFullScan()
                              ? changeTracker->getFallbackReason() : "none";
   if (lastIterationWasRegional) {
-    dirtyBlocks.insert(changeTracker->getDirtyBlocks().begin(),
-                       changeTracker->getDirtyBlocks().end());
-    if (!updateFullWorklistSize(changeTracker->getInstructionCountChange() -
-                               countChangeAfterSeed))
-      lastIterationWasRegional = false;
+    if (importedSeed) {
+      // The pass manager has already applied the producer's checked net
+      // instruction delta. No instruction identity survives that handoff.
+      dirtyBlocks.insert(importedDirtyBlocks.begin(), importedDirtyBlocks.end());
+    } else {
+      dirtyBlocks.insert(changeTracker->getDirtyBlocks().begin(),
+                         changeTracker->getDirtyBlocks().end());
+      if (!updateFullWorklistSize(changeTracker->getInstructionCountChange() -
+                                 countChangeAfterSeed))
+        lastIterationWasRegional = false;
+    }
   }
+  importedDirtyBlocks.clear();
   if (changeTracker)
     changeTracker->reset();
 
@@ -496,6 +505,10 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration,
   if (lastIterationWasRegional) {
     ++regionalSeeds;
     regionalSeedInstructions += Worklist.size();
+    if (importedSeed) {
+      ++crossPassSeeds;
+      crossPassSeedInstructions += Worklist.size();
+    }
   } else {
     ++fullSeeds;
     fullSeedInstructions += Worklist.size();
@@ -509,6 +522,7 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration,
   if (PrintChangedRegions)
     llvm::errs() << "silcombine-region-round function=" << F.getName()
                  << " regional=" << lastIterationWasRegional
+                 << " cross_pass=" << (lastIterationWasRegional && importedSeed)
                  << " instructions=" << Worklist.size()
                  << " fallback=" << fallback << '\n';
 
@@ -733,6 +747,9 @@ static FunctionTest SILCombineVisitInstruction(
 
 bool SILCombiner::runOnFunction(SILFunction &F) {
   clear();
+  if (changeTracker)
+    parentTransform->getPassManager()->takeSILCombineRegion(
+        &F, importedDirtyBlocks, fullWorklistSize);
 
   bool Changed = false;
   // Perform iterations until we do not make any changes.
@@ -746,6 +763,7 @@ bool SILCombiner::runOnFunction(SILFunction &F) {
       break;
     ++Iteration;
   }
+  bool fullSaturation = !lastIterationWasRegional;
 
   // The wrapper's stack/phi/lifetime repairs are deliberately outside this
   // check: they are also outside the original combiner's fixed-point loop.
@@ -761,9 +779,21 @@ bool SILCombiner::runOnFunction(SILFunction &F) {
                  << " regional_seeds=" << regionalSeeds
                  << " full_instructions=" << fullSeedInstructions
                  << " regional_instructions=" << regionalSeedInstructions
+                 << " cross_pass_seeds=" << crossPassSeeds
+                 << " cross_pass_instructions=" << crossPassSeedInstructions
                  << " fallback="
                  << (changeTracker && changeTracker->requiresFullScan()
                          ? changeTracker->getFallbackReason() : "none") << '\n';
+
+  // This is a pending claim only. The pass manager commits it after checking
+  // that this pass had no invalidation, callee dependency, or wrapper repair.
+  // In particular, shadow verification must not make a regional production
+  // run appear to have obtained a full saturation of its own.
+  if (changeTracker && !Changed && !aborted && fullSaturation &&
+      !invalidatedStackNesting && !F.needBreakInfiniteLoops() &&
+      !F.needCompleteLifetimes())
+    parentTransform->getPassManager()->publishSILCombineSaturation(
+        &F, fullWorklistSize);
 
   if (invalidatedStackNesting) {
     StackNesting::fixNesting(&F);

@@ -119,6 +119,9 @@ private:
   int64_t countChangeAfterSeed = 0;
   unsigned fullSeeds = 0, regionalSeeds = 0;
   uint64_t fullSeedInstructions = 0, regionalSeedInstructions = 0;
+  llvm::SmallVector<SILBasicBlock *, 16> importedDirtyBlocks;
+  unsigned crossPassSeeds = 0;
+  uint64_t crossPassSeedInstructions = 0;
   bool lastIterationWasRegional = false;
   bool aborted = false;
 
@@ -172,6 +175,9 @@ public:
     MadeChange = false;
     fullWorklistSize = fullSeeds = regionalSeeds = 0;
     fullSeedInstructions = regionalSeedInstructions = 0;
+    importedDirtyBlocks.clear();
+    crossPassSeeds = 0;
+    crossPassSeedInstructions = 0;
     countChangeAfterSeed = 0;
     lastIterationWasRegional = aborted = false;
     if (changeTracker)
