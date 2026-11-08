@@ -122,7 +122,7 @@ final public class BasicBlock : CustomStringConvertible, HasShortDescription, Ha
   //===----------------------------------------------------------------------===//
 
   public var instructions: InstructionList {
-    InstructionList(first: bridged.getFirstInst().instruction)
+    InstructionList(firstBridged: bridged.getFirstInst())
   }
 
   public var terminator: TermInst {
@@ -205,32 +205,39 @@ final public class BasicBlock : CustomStringConvertible, HasShortDescription, Ha
 /// It's allowed to delete the current, next or any other instructions while
 /// iterating over the instruction list.
 public struct InstructionList : CollectionLikeSequence, IteratorProtocol {
-  private var currentInstruction: Instruction?
+  // SIL owns the instruction nodes, including nodes whose deletion is deferred
+  // while a pass iterates over them. Keep the cursor without Swift ARC traffic.
+  private var currentInstruction: OptionalBridgedInstruction
 
-  public init(first: Instruction?) { currentInstruction = first }
+  public init(first: Instruction?) { currentInstruction = first.bridged }
+
+  fileprivate init(firstBridged: OptionalBridgedInstruction) {
+    currentInstruction = firstBridged
+  }
 
   public mutating func next() -> Instruction? {
-    if var inst = currentInstruction {
-      while inst.isDeleted {
-        guard let nextInst = inst.next else {
+    if let obj = currentInstruction.obj {
+      var inst = BridgedInstruction(obj)
+      while inst.isDeleted() {
+        guard let nextObj = inst.getNext().obj else {
           return nil
         }
-        inst = nextInst
+        inst = BridgedInstruction(nextObj)
       }
-      currentInstruction = inst.next
-      return inst
+      currentInstruction = inst.getNext()
+      return inst.instruction
     }
     return nil
   }
 
-  public var first: Instruction? { currentInstruction }
+  public var first: Instruction? { currentInstruction.instruction }
 
   public var last: Instruction? { reversed().first }
 
   public func reversed() -> ReverseInstructionList {
-    if let inst = currentInstruction {
-      let lastInst = inst.bridged.getLastInstOfParent().instruction
-      return ReverseInstructionList(first: lastInst)
+    if let obj = currentInstruction.obj {
+      let lastInst = BridgedInstruction(obj).getLastInstOfParent()
+      return ReverseInstructionList(firstBridged: lastInst.optional)
     }
     return ReverseInstructionList(first: nil)
   }
@@ -241,25 +248,31 @@ public struct InstructionList : CollectionLikeSequence, IteratorProtocol {
 /// It's allowed to delete the current, next or any other instructions while
 /// iterating over the instruction list.
 public struct ReverseInstructionList : CollectionLikeSequence, IteratorProtocol {
-  private var currentInstruction: Instruction?
+  // As in InstructionList, the cursor does not own the C++ instruction node.
+  private var currentInstruction: OptionalBridgedInstruction
 
-  public init(first: Instruction?) { currentInstruction = first }
+  public init(first: Instruction?) { currentInstruction = first.bridged }
+
+  fileprivate init(firstBridged: OptionalBridgedInstruction) {
+    currentInstruction = firstBridged
+  }
 
   public mutating func next() -> Instruction? {
-    if var inst = currentInstruction {
-      while inst.isDeleted {
-        guard let nextInst = inst.previous else {
+    if let obj = currentInstruction.obj {
+      var inst = BridgedInstruction(obj)
+      while inst.isDeleted() {
+        guard let nextObj = inst.getPrevious().obj else {
           return nil
         }
-        inst = nextInst
+        inst = BridgedInstruction(nextObj)
       }
-      currentInstruction = inst.previous
-      return inst
+      currentInstruction = inst.getPrevious()
+      return inst.instruction
     }
     return nil
   }
 
-  public var first: Instruction? { currentInstruction }
+  public var first: Instruction? { currentInstruction.instruction }
 }
 
 public struct ArgumentArray : RandomAccessCollection {

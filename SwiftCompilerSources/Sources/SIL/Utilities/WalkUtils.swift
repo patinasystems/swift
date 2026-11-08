@@ -133,16 +133,17 @@ public struct WalkerCache<Path : WalkingPath> {
   public init() {}
 
   public mutating func needWalk(for value: Value, path: Path) -> Path? {
+    let valueID = value.hashable
 
     // Handle the first inline entry.
     guard let e = inlineEntry0 else {
-      inlineEntry0 = (value, path)
+      inlineEntry0 = (valueID, path)
       return path
     }
-    if e.value == value {
+    if e.valueID == valueID {
       let newPath = e.path.merge(with: path)
       if newPath != e.path {
-        inlineEntry0 = (value, newPath)
+        inlineEntry0 = (valueID, newPath)
         return newPath
       }
       return nil
@@ -150,20 +151,20 @@ public struct WalkerCache<Path : WalkingPath> {
     
     // Handle the second inline entry.
     guard let e = inlineEntry1 else {
-      inlineEntry1 = (value, path)
+      inlineEntry1 = (valueID, path)
       return path
     }
-    if e.value == value {
+    if e.valueID == valueID {
       let newPath = e.path.merge(with: path)
       if newPath != e.path {
-        inlineEntry1 = (value, newPath)
+        inlineEntry1 = (valueID, newPath)
         return newPath
       }
       return nil
     }
     
     // If there are more than two elements, it goes into the `cache` Dictionary.
-    return cache[value.hashable, default: CacheEntry()].needWalk(path: path)
+    return cache[valueID, default: CacheEntry()].needWalk(path: path)
   }
 
   mutating func clear() {
@@ -192,11 +193,38 @@ public struct WalkerCache<Path : WalkingPath> {
   // If there are no more than 2 elements in the cache, we can avoid using the `cache` Dictionary,
   // which avoids memory allocations.
   // Fortunately this is the common case by far (about 97% of all walker invocations).
-  private var inlineEntry0: (value: Value, path: Path)?
-  private var inlineEntry1: (value: Value, path: Path)?
+  // The cache only compares value identity; retaining a Value existential is
+  // unnecessary, just as for the entries in the Dictionary below.
+  private var inlineEntry0: (valueID: HashableValue, path: Path)?
+  private var inlineEntry1: (valueID: HashableValue, path: Path)?
 
   // All elements, which don't fit into the inline entries.
   private var cache = Dictionary<HashableValue, CacheEntry>()
+}
+
+let walkerCacheTest = Test("walker_cache") { function, arguments, context in
+  let values = (0 ..< 3).map { _ in arguments.takeValue() }
+  let field = SmallProjectionPath(.structField, index: 0)
+  let anyPath = SmallProjectionPath(.anything)
+  var cache = WalkerCache<SmallProjectionPath>()
+
+  print("Walker cache in \(function.name):")
+  for value in values {
+    print("new: \(cache.needWalk(for: value, path: field) == field)")
+  }
+  for value in values {
+    print("repeat: \(cache.needWalk(for: value, path: field) == nil)")
+  }
+  for value in values {
+    print("merge: \(cache.needWalk(for: value, path: anyPath) == anyPath)")
+  }
+  for value in values {
+    print("subsumed: \(cache.needWalk(for: value, path: field) == nil)")
+  }
+  cache.clear()
+  for value in values {
+    print("reset: \(cache.needWalk(for: value, path: field) == field)")
+  }
 }
 
 /// - A `DefUseWalker` finds all uses of a target value.
