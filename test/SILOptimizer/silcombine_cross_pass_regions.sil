@@ -1,0 +1,205 @@
+// RUN: %empty-directory(%t)
+// RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine-changed-regions=false -sil-combine -common-subexpression-elimination -sil-combine %s > %t/full.sil
+// RUN: %FileCheck %s < %t/full.sil
+// RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions -sil-combine -common-subexpression-elimination -sil-combine %s > %t/regions.sil 2> %t/regions.log
+// RUN: %FileCheck %s < %t/regions.sil
+// RUN: %FileCheck %s --check-prefix=CROSS < %t/regions.log
+
+sil_stage canonical
+
+import Builtin
+import Swift
+
+class CrossRegionBase {}
+class CrossRegionChild : CrossRegionBase {}
+sil @cross_region_use_objects : $@convention(thin) (@guaranteed CrossRegionBase, @guaranteed CrossRegionBase) -> ()
+
+// The first SILCombine is already saturated. CSE replaces only the second
+// wrapping integer add, whose sole use is a non-terminator tuple instruction.
+// The next SILCombine must import a region across the intervening pass flush.
+// It must also pass the original full-combiner saturation check.
+// CROSS-LABEL: silcombine-regions function=cross_pass_pure_duplicate
+// CROSS-SAME: cross_pass_seeds=0
+// CROSS: silcombine-regions function=cross_pass_pure_duplicate
+// CROSS-SAME: cross_pass_seeds=1
+// CHECK-LABEL: sil @cross_pass_pure_duplicate
+// CHECK: [[SUM:%.*]] = builtin "add_Int64"
+// CHECK-NOT: builtin "add_Int64"
+// CHECK: [[PAIR:%.*]] = tuple ([[SUM]] : $Builtin.Int64, [[SUM]] : $Builtin.Int64)
+// CHECK: br bb3([[PAIR]] : $(Builtin.Int64, Builtin.Int64))
+// CHECK: bb3([[EXIT:%.*]] : $(Builtin.Int64, Builtin.Int64)):
+// CHECK: return [[EXIT]] : $(Builtin.Int64, Builtin.Int64)
+// CHECK: } // end sil function 'cross_pass_pure_duplicate'
+sil @cross_pass_pure_duplicate : $@convention(thin) (Builtin.Int64, Builtin.Int64, Builtin.Int1) -> (Builtin.Int64, Builtin.Int64) {
+bb0(%left : $Builtin.Int64, %right : $Builtin.Int64, %condition : $Builtin.Int1):
+  %sum = builtin "add_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int64
+  cond_br %condition, bb1, bb2
+
+bb1:
+  %duplicate = builtin "add_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int64
+  %pair = tuple (%sum : $Builtin.Int64, %duplicate : $Builtin.Int64)
+  br bb3(%pair : $(Builtin.Int64, Builtin.Int64))
+
+bb2:
+  %other = tuple (%right : $Builtin.Int64, %left : $Builtin.Int64)
+  br bb3(%other : $(Builtin.Int64, Builtin.Int64))
+
+bb3(%result : $(Builtin.Int64, Builtin.Int64)):
+  return %result : $(Builtin.Int64, Builtin.Int64)
+}
+
+// A changed first SILCombine cannot publish the settled no-change baseline
+// required by the first cross-pass prototype, even if CSE's edit is local.
+// CROSS-LABEL: silcombine-regions function=cross_pass_without_settled_baseline
+// CROSS-SAME: cross_pass_seeds=0
+// CROSS: silcombine-regions function=cross_pass_without_settled_baseline
+// CROSS-SAME: cross_pass_seeds=0
+// CHECK-LABEL: sil @cross_pass_without_settled_baseline
+// CHECK: [[SUM:%.*]] = builtin "add_Int64"
+// CHECK-NOT: builtin "add_Int64"
+// CHECK: [[PAIR:%.*]] = tuple ([[SUM]] : $Builtin.Int64, [[SUM]] : $Builtin.Int64)
+// CHECK: return [[PAIR]] : $(Builtin.Int64, Builtin.Int64)
+// CHECK: } // end sil function 'cross_pass_without_settled_baseline'
+sil @cross_pass_without_settled_baseline : $@convention(thin) (Builtin.Int64, Builtin.Int64) -> (Builtin.Int64, Builtin.Int64) {
+bb0(%left : $Builtin.Int64, %right : $Builtin.Int64):
+  %unused = tuple (%left : $Builtin.Int64, %right : $Builtin.Int64)
+  %sum = builtin "add_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int64
+  br bb1
+
+bb1:
+  %duplicate = builtin "add_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int64
+  %pair = tuple (%sum : $Builtin.Int64, %duplicate : $Builtin.Int64)
+  return %pair : $(Builtin.Int64, Builtin.Int64)
+}
+
+// CSE itself can mutate a terminator operand without changing the CFG shape.
+// Such a replacement is outside the audited local SSA handoff.
+// CROSS-LABEL: silcombine-regions function=cross_pass_branch_operand
+// CROSS-SAME: cross_pass_seeds=0
+// CROSS: silcombine-regions function=cross_pass_branch_operand
+// CROSS-SAME: cross_pass_seeds=0
+// CHECK-LABEL: sil @cross_pass_branch_operand
+// CHECK: [[LESS:%.*]] = builtin "cmp_slt_Int64"
+// CHECK: cond_br [[LESS]], bb1, bb3
+// CHECK: bb1:
+// CHECK-NOT: builtin "cmp_slt_Int64"
+// CHECK: cond_br [[LESS]], bb2, bb3
+// CHECK: } // end sil function 'cross_pass_branch_operand'
+sil @cross_pass_branch_operand : $@convention(thin) (Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
+bb0(%left : $Builtin.Int64, %right : $Builtin.Int64):
+  %less = builtin "cmp_slt_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int1
+  cond_br %less, bb1, bb3
+
+bb1:
+  %duplicate = builtin "cmp_slt_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int1
+  cond_br %duplicate, bb2, bb3
+
+bb2:
+  br bb4(%left : $Builtin.Int64)
+
+bb3:
+  br bb4(%right : $Builtin.Int64)
+
+bb4(%result : $Builtin.Int64):
+  return %result : $Builtin.Int64
+}
+
+// Nontrivial guaranteed values need ownership reasoning beyond this journal.
+// CSE must retain its original optimization while dropping the handoff.
+// CROSS-LABEL: silcombine-regions function=cross_pass_ownership
+// CROSS-SAME: cross_pass_seeds=0
+// CROSS: silcombine-regions function=cross_pass_ownership
+// CROSS-SAME: cross_pass_seeds=0
+// CHECK-LABEL: sil [ossa] @cross_pass_ownership
+// CHECK: [[BASE:%.*]] = upcast
+// CHECK-NOT: upcast
+// CHECK: apply {{%.*}}([[BASE]], [[BASE]])
+// CHECK: } // end sil function 'cross_pass_ownership'
+sil [ossa] @cross_pass_ownership : $@convention(thin) (@guaranteed CrossRegionChild) -> () {
+bb0(%object : @guaranteed $CrossRegionChild):
+  %base = upcast %object : $CrossRegionChild to $CrossRegionBase
+  br bb1
+
+bb1:
+  %duplicate = upcast %object : $CrossRegionChild to $CrossRegionBase
+  %use = function_ref @cross_region_use_objects : $@convention(thin) (@guaranteed CrossRegionBase, @guaranteed CrossRegionBase) -> ()
+  %void = apply %use(%base, %duplicate) : $@convention(thin) (@guaranteed CrossRegionBase, @guaranteed CrossRegionBase) -> ()
+  %empty = tuple ()
+  return %empty : $()
+}
+
+// Address projections may be CSE'd, but address/memory edits cannot reuse the
+// settled pure-value baseline. Both loads must still read the projected field.
+// CROSS-LABEL: silcombine-regions function=cross_pass_address
+// CROSS-SAME: cross_pass_seeds=0
+// CROSS: silcombine-regions function=cross_pass_address
+// CROSS-SAME: cross_pass_seeds=0
+// CHECK-LABEL: sil [ossa] @cross_pass_address
+// CHECK: [[FIELD:%.*]] = tuple_element_addr
+// CHECK-NOT: tuple_element_addr
+// CHECK: load [trivial] [[FIELD]]
+// CHECK: load [trivial] [[FIELD]]
+// CHECK: builtin "add_Int64"
+// CHECK: } // end sil function 'cross_pass_address'
+sil [ossa] @cross_pass_address : $@convention(thin) (@inout (Builtin.Int64, Builtin.Int64)) -> Builtin.Int64 {
+bb0(%storage : $*(Builtin.Int64, Builtin.Int64)):
+  %field = tuple_element_addr %storage : $*(Builtin.Int64, Builtin.Int64), 0
+  br bb1
+
+bb1:
+  %duplicate = tuple_element_addr %storage : $*(Builtin.Int64, Builtin.Int64), 0
+  %first = load [trivial] %field : $*Builtin.Int64
+  %second = load [trivial] %duplicate : $*Builtin.Int64
+  %sum = builtin "add_Int64"(%first : $Builtin.Int64, %second : $Builtin.Int64) : $Builtin.Int64
+  return %sum : $Builtin.Int64
+}
+
+final class CrossRegionLazy {
+  final var value: Int64 { get set }
+  @_hasStorage @_hasInitialValue final var storage: Int64? { get set }
+  init()
+}
+
+sil private [lazy_getter] [noinline] [ossa] @cross_region_lazy_getter : $@convention(method) (@guaranteed CrossRegionLazy) -> Int64 {
+bb0(%object : @guaranteed $CrossRegionLazy):
+  %address = ref_element_addr %object : $CrossRegionLazy, #CrossRegionLazy.storage
+  %loaded = load [trivial] %address : $*Optional<Int64>
+  switch_enum %loaded : $Optional<Int64>, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+
+bb1(%existing : $Int64):
+  br bb3(%existing : $Int64)
+
+bb2:
+  %literal = integer_literal $Builtin.Int64, 27
+  %value = struct $Int64 (%literal : $Builtin.Int64)
+  %initialized = enum $Optional<Int64>, #Optional.some!enumelt, %value : $Int64
+  store %initialized to [trivial] %address : $*Optional<Int64>
+  br bb3(%value : $Int64)
+
+bb3(%result : $Int64):
+  return %result : $Int64
+}
+
+// Lazy-getter CSE performs inlining, branch replacement and repair outside the
+// plain replacement transaction. It must invalidate all accumulated regions.
+// CROSS-LABEL: silcombine-regions function=cross_pass_lazy_getter
+// CROSS-SAME: cross_pass_seeds=0
+// CROSS: silcombine-regions function=cross_pass_lazy_getter
+// CROSS-SAME: cross_pass_seeds=0
+// CHECK-LABEL: sil @cross_pass_lazy_getter
+// CHECK: [[GETTER:%.*]] = function_ref @cross_region_lazy_getter
+// CHECK: apply [[GETTER]]
+// CHECK-NOT: apply [[GETTER]]
+// CHECK: return
+// CHECK: } // end sil function 'cross_pass_lazy_getter'
+sil @cross_pass_lazy_getter : $@convention(thin) (@guaranteed CrossRegionLazy) -> (Int64, Int64) {
+bb0(%object : $CrossRegionLazy):
+  %getter = function_ref @cross_region_lazy_getter : $@convention(method) (@guaranteed CrossRegionLazy) -> Int64
+  %first = apply %getter(%object) : $@convention(method) (@guaranteed CrossRegionLazy) -> Int64
+  br bb1
+
+bb1:
+  %second = apply %getter(%object) : $@convention(method) (@guaranteed CrossRegionLazy) -> Int64
+  %pair = tuple (%first : $Int64, %second : $Int64)
+  return %pair : $(Int64, Int64)
+}
