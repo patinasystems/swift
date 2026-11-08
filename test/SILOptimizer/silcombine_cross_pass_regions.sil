@@ -4,6 +4,8 @@
 // RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions -sil-combine -common-subexpression-elimination -sil-combine %s > %t/regions.sil 2> %t/regions.log
 // RUN: %FileCheck %s < %t/regions.sil
 // RUN: %FileCheck %s --check-prefix=CROSS < %t/regions.log
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions -sil-combine -common-subexpression-elimination -dce -sil-combine %s > %t/barrier.sil 2> %t/barrier.log
+// RUN: %FileCheck %s --check-prefix=BARRIER < %t/barrier.log
 
 sil_stage canonical
 
@@ -22,6 +24,13 @@ sil @cross_region_use_objects : $@convention(thin) (@guaranteed CrossRegionBase,
 // CROSS-SAME: cross_pass_seeds=0
 // CROSS: silcombine-regions function=cross_pass_pure_duplicate
 // CROSS-SAME: cross_pass_seeds=1
+// An unaudited intervening pass is a barrier even when it makes no changes.
+// This protects same-function metadata/context changes without assuming every
+// legacy pass sends a precise mutation notification.
+// BARRIER-LABEL: silcombine-regions function=cross_pass_pure_duplicate
+// BARRIER-SAME: cross_pass_seeds=0
+// BARRIER: silcombine-regions function=cross_pass_pure_duplicate
+// BARRIER-SAME: cross_pass_seeds=0
 // CHECK-LABEL: sil @cross_pass_pure_duplicate
 // CHECK: [[SUM:%.*]] = builtin "add_Int64"
 // CHECK-NOT: builtin "add_Int64"
