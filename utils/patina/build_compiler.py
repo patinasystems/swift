@@ -64,6 +64,7 @@ def main():
     output(['git', 'cat-file', '-e', lock['upstream_revision']], root)
     developer = Path(output(['xcode-select', '-p']))
     tools = developer / 'Toolchains/XcodeDefault.xctoolchain/usr/bin'
+    host_tools = Path(os.environ.get('SWIFT_NATIVE_SWIFT_TOOLS_PATH', str(tools))).resolve()
     options = [
         '--release', '--assertions', '--bootstrapping=hosttools', '--reconfigure',
         '--skip-build-osx', '--skip-build-benchmarks', '--skip-early-swift-driver',
@@ -71,7 +72,8 @@ def main():
         '--build-embedded-stdlib=false',
         '--extra-llvm-cmake-options=-DLLVM_INCLUDE_RUNTIMES=OFF',
         '--llvm-targets-to-build=AArch64', '--enable-new-runtime-build=false',
-        '--native-swift-tools-path=' + str(tools), '--no-swift-pedantic-diagnostics',
+        '--native-swift-tools-path=' + str(host_tools), '--no-swift-pedantic-diagnostics',
+        '--extra-swift-cmake-options=-DCMAKE_Swift_COMPILER=' + str(host_tools / 'swiftc'),
         '--extra-swift-cmake-options=-DSWIFT_APPEND_VC_REV=OFF',
         '--extra-swift-cmake-options=-DSWIFT_BUILD_REGEX_PARSER_IN_COMPILER=ON',
         '--build-subdir=patina-solver', '--jobs=' + str(args.jobs),
@@ -95,7 +97,7 @@ def main():
         'dependency_lock_sha256': digest(lock_path),
         'build_options': [o for o in options if not o.startswith('--jobs=')],
         'build_jobs': args.jobs,
-        'host_swift_version': output([str(tools / 'swiftc'), '--version']),
+        'host_swift_version': output([str(host_tools / 'swiftc'), '--version']),
         'host_clang_version': output([str(tools / 'clang'), '--version']),
         'resource_dir': str(tools.parent / 'lib/swift'),
     }
