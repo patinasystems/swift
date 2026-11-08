@@ -4,6 +4,7 @@
   "repositories": {
     "cmark": "437611671145d47e6d9679761b8a5987766f4ae5",
     "llvm-project": "248b8c1fc264fc63ee3e159f283ad471738c025a",
-    "swift-syntax": "9e3e3d5adee0f5577166f09dc535e528e7ad8641"
+    "swift-syntax": "9e3e3d5adee0f5577166f09dc535e528e7ad8641",
+    "swift-experimental-string-processing": "1ca4363d0591f9b323d17656c03225a7bfa9daff"
   }
 }
