@@ -169,6 +169,10 @@ struct BridgedPassContext {
 
   BRIDGED_INLINE void updateAnalysis() const;
 
+  BRIDGED_INLINE bool beginCSERegionReplacement(BridgedInstruction oldInst,
+                                               BridgedInstruction replacement) const;
+  BRIDGED_INLINE void endCSERegionReplacement() const;
+
   // Analysis
 
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedAliasAnalysis getAliasAnalysis() const;

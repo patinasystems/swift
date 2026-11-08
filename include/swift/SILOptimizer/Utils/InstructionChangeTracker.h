@@ -73,7 +73,8 @@ class InstructionChangeTracker {
   bool supportsMutation(SILInstruction *inst) {
     if (!recordBlock(inst))
       return false;
-    if (isa<TermInst>(inst) || FullApplySite::isa(inst) ||
+    if (isa<TermInst, FunctionRefInst, DynamicFunctionRefInst,
+            PreviousDynamicFunctionRefInst>(inst) || FullApplySite::isa(inst) ||
         inst->mayHaveSideEffects()) {
       requireFullScan("nonlocal instruction mutation");
       return false;
