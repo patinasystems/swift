@@ -47,6 +47,11 @@ binary and companion SwiftSyntax libraries, source diff, dependency-lock digest,
 versions, and linked libraries are recorded together. Rebuilds reuse the build
 directory; each retained compiler output directory must be new.
 
+The host prefix must include `swift-compatibility-symbols`, which Xcode may omit.
+Set `SWIFT_NATIVE_SWIFT_TOOLS_PATH` to a complete host prefix's `bin` directory
+when needed. The build records this path and its Swift version. A separate
+prefix can reuse Xcode's tools and the compatibility tool built by this checkout.
+
 Both builds disable appending the Git revision to the compiler's user-visible
 version. Swift serializes that string into modules, so a bookkeeping commit
 would otherwise break byte-for-byte module comparisons. The records retain the
