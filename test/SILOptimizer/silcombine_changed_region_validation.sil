@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine %s > %t/full.sil
+// RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine -sil-combine-changed-regions=false %s > %t/full.sil
 // RUN: %FileCheck %s < %t/full.sil
 // RUN: %target-sil-opt -sil-print-types -sil-print-transform-blocks=false -enable-sil-verify-all -sil-combine -sil-combine-changed-regions -sil-combine-verify-changed-regions -sil-combine-print-changed-regions %s > %t/regions.sil 2> %t/regions.log
 // RUN: %FileCheck %s < %t/regions.sil
