@@ -1,11 +1,13 @@
 // RUN: %empty-directory(%t)
 // RUN: %gyb %s > %t/active-roots.sil
-// RUN: %target-sil-opt -enable-sil-verify-all -retain-sinking -late-release-hoisting %t/active-roots.sil | %FileCheck %t/active-roots.sil
-// RUN: %target-sil-opt -enable-sil-verify-all -release-hoisting %t/active-roots.sil | %FileCheck %t/active-roots.sil
+// RUN: %target-sil-opt -enable-sil-verify-all -retain-sinking -late-release-hoisting %t/active-roots.sil | %FileCheck --check-prefixes=CHECK,LATE %t/active-roots.sil
+// RUN: %target-sil-opt -enable-sil-verify-all -release-hoisting %t/active-roots.sil | %FileCheck --check-prefixes=CHECK,FROZEN %t/active-roots.sil
 
 import Builtin
 
 sil_stage canonical
+
+sil @active_roots_barrier : $@convention(thin) () -> ()
 
 // Use enough distinct roots to exercise multiple words in the dataflow
 // bitvectors. Each release blocks the active retain, then the next retain
@@ -25,6 +27,7 @@ bb1:
   strong_retain %root${i} : $Builtin.NativeObject
   strong_release %root${i} : $Builtin.NativeObject
 % end
+
 % if hasLoop:
   cond_br %condition, bb2, bb3
 
@@ -40,3 +43,105 @@ bb3:
 }
 
 % end
+
+// Keep all 70 retains live across an opaque call. Its blocker queries clear
+// multiple words of active roots in the same instruction. Check roots on both
+// sides of the word boundary, including the last root, survive the passes.
+// CHECK-LABEL: sil @active_roots_multiple_words
+// CHECK: [[BARRIER:%.*]] = function_ref @active_roots_barrier
+// CHECK: bb1:
+// CHECK: strong_retain %0 : $Builtin.NativeObject
+// CHECK: strong_retain %63 : $Builtin.NativeObject
+// CHECK-NEXT: strong_retain %64 : $Builtin.NativeObject
+// CHECK: strong_retain %69 : $Builtin.NativeObject
+// CHECK: apply [[BARRIER]]()
+// CHECK: strong_release %0 : $Builtin.NativeObject
+// CHECK: strong_release %63 : $Builtin.NativeObject
+// CHECK-NEXT: strong_release %64 : $Builtin.NativeObject
+// CHECK: strong_release %69 : $Builtin.NativeObject
+// CHECK: return
+sil @active_roots_multiple_words : $@convention(thin) (${', '.join(['Builtin.NativeObject'] * 70)}, Builtin.Int1) -> () {
+bb0(${', '.join('%%root%d : $Builtin.NativeObject' % i for i in range(70))}, %condition : $Builtin.Int1):
+  %%barrier = function_ref @active_roots_barrier : $@convention(thin) () -> ()
+  br bb1
+
+bb1:
+% for i in range(70):
+  strong_retain %root${i} : $Builtin.NativeObject
+% end
+  apply %barrier() : $@convention(thin) () -> ()
+% for i in range(70):
+  strong_release %root${i} : $Builtin.NativeObject
+% end
+  cond_br %condition, bb2, bb3
+
+bb2:
+  br bb1
+
+bb3:
+  %%result = tuple ()
+  return %result : $()
+}
+
+// In forward order, the first two calls kill the retain root, the retain
+// regenerates it, and the third call must kill it again. In reverse order,
+// the final two calls kill the release root, the release regenerates it, and
+// the third call must kill it again. Neither RC operation may cross that call.
+// CHECK-LABEL: sil @active_roots_kill_regenerate
+// CHECK: [[BARRIER:%.*]] = function_ref @active_roots_barrier
+// CHECK: bb1:
+// CHECK-NEXT: {{.*}}apply [[BARRIER]]()
+// CHECK-NEXT: {{.*}}apply [[BARRIER]]()
+// CHECK-NEXT: strong_retain %0 : $Builtin.NativeObject
+// CHECK-NEXT: {{.*}}apply [[BARRIER]]()
+// CHECK-NEXT: strong_release %0 : $Builtin.NativeObject
+// CHECK-NEXT: {{.*}}apply [[BARRIER]]()
+// CHECK-NEXT: {{.*}}apply [[BARRIER]]()
+// CHECK: return
+sil @active_roots_kill_regenerate : $@convention(thin) (Builtin.NativeObject, Builtin.Int1) -> () {
+bb0(%root : $Builtin.NativeObject, %condition : $Builtin.Int1):
+  %%barrier = function_ref @active_roots_barrier : $@convention(thin) () -> ()
+  br bb1
+
+bb1:
+  apply %barrier() : $@convention(thin) () -> ()
+  apply %barrier() : $@convention(thin) () -> ()
+  strong_retain %root : $Builtin.NativeObject
+  apply %barrier() : $@convention(thin) () -> ()
+  strong_release %root : $Builtin.NativeObject
+  apply %barrier() : $@convention(thin) () -> ()
+  apply %barrier() : $@convention(thin) () -> ()
+  cond_br %condition, bb2, bb3
+
+bb2:
+  br bb1
+
+bb3:
+  %%result = tuple ()
+  return %result : $()
+}
+
+// Early hoisting must leave the consumed argument's epilogue release in its
+// exit block. Late hoisting can move it to the argument's defining block.
+// FROZEN-LABEL: sil @active_roots_frozen_epilogue
+// FROZEN: bb0(%0 : $Builtin.NativeObject):
+// FROZEN-NEXT: br bb1
+// FROZEN: bb1:
+// FROZEN: strong_release %0 : $Builtin.NativeObject
+// FROZEN-NEXT: return
+// LATE-LABEL: sil @active_roots_frozen_epilogue
+// LATE: bb0(%0 : $Builtin.NativeObject):
+// LATE-NEXT: strong_release %0 : $Builtin.NativeObject
+// LATE-NEXT: br bb1
+// LATE: bb1:
+// LATE-NOT: strong_release
+// LATE: return
+sil @active_roots_frozen_epilogue : $@convention(thin) (@owned Builtin.NativeObject) -> () {
+bb0(%root : $Builtin.NativeObject):
+  br bb1
+
+bb1:
+  %%result = tuple ()
+  strong_release %root : $Builtin.NativeObject
+  return %result : $()
+}
