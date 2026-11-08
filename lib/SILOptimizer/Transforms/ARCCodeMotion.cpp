@@ -485,7 +485,10 @@ void RetainCodeMotionContext::computeCodeMotionGenKillSet() {
     for (auto &I : *BB) {
       // Check whether this instruction blocks any RC root code motion.
       for (unsigned i = 0; i < RCRootVault.size(); ++i) {
-        if (!State.BBMaxSet.test(i) || !mayBlockCodeMotion(&I, RCRootVault[i]))
+        // A killed root has no generated retain. Further blockers cannot
+        // change its state until a matching retain below generates it again.
+        if (!State.BBMaxSet.test(i) || State.BBKillSet.test(i) ||
+            !mayBlockCodeMotion(&I, RCRootVault[i]))
           continue;
         // This is a blocking instruction for the rcroot.
         InterestBlock = true;
@@ -885,7 +888,10 @@ void ReleaseCodeMotionContext::computeCodeMotionGenKillSet() {
     for (auto I = BB->rbegin(), E = BB->rend(); I != E; ++I) {
       // Check whether this instruction blocks any RC root code motion.
       for (unsigned i = 0; i < RCRootVault.size(); ++i) {
-        if (!State.BBMaxSet.test(i) || !mayBlockCodeMotion(&*I, RCRootVault[i]))
+        // A killed root has no generated release. Further blockers cannot
+        // change its state until a matching release below generates it again.
+        if (!State.BBMaxSet.test(i) || State.BBKillSet.test(i) ||
+            !mayBlockCodeMotion(&*I, RCRootVault[i]))
           continue;
         // This instruction blocks this RC root.
         InterestBlock = true;
