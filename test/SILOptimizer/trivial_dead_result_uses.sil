@@ -1,4 +1,7 @@
-// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -test-runner %s -o /dev/null 2>&1 | %FileCheck %s
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -opt-mode=none -test-runner %s -o /dev/null 2>&1 | %FileCheck %s
+
+// Run the explicitly requested pass as mandatory so it also visits Onone
+// functions. Each function's attribute still selects its own optimization mode.
 
 import Builtin
 
