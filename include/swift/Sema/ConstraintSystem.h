@@ -1018,6 +1018,35 @@ private:
   /// but will not be revisited until one of their inputs changes.
   ConstraintList InactiveConstraints;
 
+  /// Disjunctions in exactly the same order as InactiveConstraints. Ordinary
+  /// constraint updates maintain this worklist; component transfers rebuild it
+  /// lazily before the next selection.
+  SmallVector<Constraint *, 4> InactiveDisjunctions;
+  bool InactiveDisjunctionsNeedRebuild = false;
+
+  void invalidateInactiveDisjunctions() {
+    InactiveDisjunctionsNeedRebuild = true;
+  }
+
+  void appendInactiveDisjunction(Constraint *constraint) {
+    if (!InactiveDisjunctionsNeedRebuild &&
+        constraint->getKind() == ConstraintKind::Disjunction)
+      InactiveDisjunctions.push_back(constraint);
+  }
+
+  void removeInactiveDisjunction(Constraint *constraint) {
+    if (InactiveDisjunctionsNeedRebuild ||
+        constraint->getKind() != ConstraintKind::Disjunction)
+      return;
+    auto where = llvm::find(InactiveDisjunctions, constraint);
+    ASSERT(where != InactiveDisjunctions.end());
+    InactiveDisjunctions.erase(where);
+  }
+
+  void restoreInactiveDisjunction(ConstraintList::iterator where,
+                                  Constraint *constraint);
+  ArrayRef<Constraint *> getInactiveDisjunctions();
+
   /// The constraint graph.
   ConstraintGraph CG;
 
@@ -2347,6 +2376,7 @@ public:
   void addUnsolvedConstraint(Constraint *constraint) {
     // We couldn't solve this constraint; add it to the pile.
     InactiveConstraints.push_back(constraint);
+    appendInactiveDisjunction(constraint);
 
     // Add this constraint to the constraint graph.
     CG.addConstraint(constraint);
@@ -2368,6 +2398,7 @@ public:
   void removeInactiveConstraint(Constraint *constraint) {
     CG.removeConstraint(constraint);
 
+    removeInactiveDisjunction(constraint);
     auto where = InactiveConstraints.erase(constraint);
     if (solverState)
       recordChange(SolverTrail::Change::RetiredConstraint(where, constraint));
@@ -2386,6 +2417,7 @@ public:
   /// for solver to attempt its simplification.
   void activateConstraint(Constraint *constraint) {
     assert(!constraint->isActive() && "Constraint is already active");
+    removeInactiveDisjunction(constraint);
     ActiveConstraints.splice(ActiveConstraints.end(), InactiveConstraints,
                              constraint);
     constraint->setActive(true);
@@ -2396,6 +2428,7 @@ public:
     InactiveConstraints.splice(InactiveConstraints.end(),
                                ActiveConstraints, constraint);
     constraint->setActive(false);
+    appendInactiveDisjunction(constraint);
   }
 
   void retireConstraint(Constraint *constraint) {

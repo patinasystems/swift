@@ -1757,11 +1757,8 @@ std::optional<std::pair<Constraint *, llvm::TinyPtrVector<Constraint *>>>
 ConstraintSystem::selectDisjunction() {
   SmallVector<Constraint *, 4> disjunctions;
 
-  // FIXME: This is inefficient.
-  for (auto &constraint : InactiveConstraints) {
-    if (constraint.getKind() == ConstraintKind::Disjunction)
-      disjunctions.push_back(&constraint);
-  }
+  auto inactiveDisjunctions = getInactiveDisjunctions();
+  disjunctions.append(inactiveDisjunctions.begin(), inactiveDisjunctions.end());
 
   if (disjunctions.empty())
     return std::nullopt;

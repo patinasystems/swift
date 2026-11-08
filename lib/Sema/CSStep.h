@@ -296,6 +296,7 @@ class ComponentStep final : public SolverStep {
       CS.TypeVariables = std::move(TypeVars);
       // return all of the saved constraints back to the component.
       auto &constraints = *Component.Constraints;
+      CS.invalidateInactiveDisjunctions();
       constraints.splice(constraints.end(), CS.InactiveConstraints);
     }
   };
@@ -358,6 +359,7 @@ public:
 
     TypeVars = std::move(component.typeVars);
 
+    CS.invalidateInactiveDisjunctions();
     for (auto constraint : component.getConstraints()) {
       constraints->erase(constraint);
       Constraints->push_back(constraint);
@@ -376,6 +378,7 @@ public:
           Constraints(constraints) {
     TypeVars = component.typeVars;
 
+    CS.invalidateInactiveDisjunctions();
     for (auto constraint : component.getConstraints()) {
       constraints->erase(constraint);
       Constraints->push_back(constraint);
@@ -747,6 +750,7 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
 
       auto &CG = CS.getConstraintGraph();
       // Remove all of the current inactive constraints.
+      CS.invalidateInactiveDisjunctions();
       Constraints.splice(Constraints.end(), CS.InactiveConstraints);
       // Clear constraint graph.
       for (auto &constraint : Constraints)
@@ -790,6 +794,7 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
     void restore() {
       DC.reset();
       CS.TypeVariables = std::move(TypeVars);
+      CS.invalidateInactiveDisjunctions();
       CS.InactiveConstraints.splice(CS.InactiveConstraints.end(), Constraints);
     }
 

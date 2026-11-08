@@ -43,6 +43,7 @@ ComponentStep::Scope::Scope(ComponentStep &component)
     CS.addTypeVariable(typeVar);
 
   auto &workList = CS.InactiveConstraints;
+  CS.invalidateInactiveDisjunctions();
   workList.splice(workList.end(), *component.Constraints);
 
   SolverScope.emplace(CS);
@@ -77,6 +78,7 @@ StepResult SplitterStep::resume(bool prevFailed) {
   // Restore the state of the constraint system to before split.
   CS.CG.setOrphanedConstraints(std::move(OrphanedConstraints));
   auto &workList = CS.InactiveConstraints;
+  CS.invalidateInactiveDisjunctions();
   for (auto &component : Components)
     workList.splice(workList.end(), component);
 
@@ -979,6 +981,7 @@ void ConjunctionStep::restoreOuterState(const Score &solutionScore) const {
   // by allowing its elements to reference type variables
   // from outer scope (e.g. variable declarations and or captures).
   {
+    CS.invalidateInactiveDisjunctions();
     CS.ActiveConstraints.splice(CS.ActiveConstraints.end(),
                                 CS.InactiveConstraints);
     for (auto &constraint : CS.ActiveConstraints)

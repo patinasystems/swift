@@ -710,6 +710,7 @@ ConstraintSystem::SolverScope::~SolverScope() {
   if (!cs.ActiveConstraints.empty()) {
     for (auto &constraint : cs.ActiveConstraints) {
       constraint.setActive(false);
+      cs.appendInactiveDisjunction(&constraint);
     }
     cs.InactiveConstraints.splice(cs.InactiveConstraints.end(),
                                   cs.ActiveConstraints);

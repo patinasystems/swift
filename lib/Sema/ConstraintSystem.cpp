@@ -58,6 +58,61 @@ using namespace inference;
 
 #define DEBUG_TYPE "ConstraintSystem"
 
+ArrayRef<Constraint *> ConstraintSystem::getInactiveDisjunctions() {
+  if (InactiveDisjunctionsNeedRebuild) {
+    InactiveDisjunctions.clear();
+    for (auto &constraint : InactiveConstraints) {
+      if (constraint.getKind() == ConstraintKind::Disjunction)
+        InactiveDisjunctions.push_back(&constraint);
+    }
+    InactiveDisjunctionsNeedRebuild = false;
+  }
+
+  // Debug solver runs also verify membership and order against the original
+  // list. Keep this full scan out of ordinary compiler invocations.
+  if (isDebugMode()) {
+    unsigned index = 0;
+    for (auto &constraint : InactiveConstraints) {
+      if (constraint.getKind() != ConstraintKind::Disjunction)
+        continue;
+      ASSERT(index < InactiveDisjunctions.size());
+      ASSERT(InactiveDisjunctions[index] == &constraint);
+      ++index;
+    }
+    ASSERT(index == InactiveDisjunctions.size());
+  }
+
+  return InactiveDisjunctions;
+}
+
+void ConstraintSystem::restoreInactiveDisjunction(
+    ConstraintList::iterator where, Constraint *constraint) {
+  if (InactiveDisjunctionsNeedRebuild ||
+      constraint->getKind() != ConstraintKind::Disjunction)
+    return;
+
+  if (InactiveDisjunctions.empty()) {
+    InactiveDisjunctions.push_back(constraint);
+    return;
+  }
+
+  // Retired constraints return before the saved successor, whose position can
+  // change during rollback. Find the next disjunction instead of assuming the
+  // retired constraint's old worklist index still describes the list.
+  while (where != InactiveConstraints.end() &&
+         where->getKind() != ConstraintKind::Disjunction)
+    ++where;
+
+  if (where == InactiveConstraints.end()) {
+    InactiveDisjunctions.push_back(constraint);
+    return;
+  }
+
+  auto next = llvm::find(InactiveDisjunctions, &*where);
+  ASSERT(next != InactiveDisjunctions.end());
+  InactiveDisjunctions.insert(next, constraint);
+}
+
 void ConstraintSystem::startExpression(ASTNode node) {
   CurrentRange = node.getSourceRange();
 

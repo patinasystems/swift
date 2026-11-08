@@ -649,6 +649,7 @@ void SolverTrail::Change::undo(ConstraintSystem &cs) const {
 
   case ChangeKind::GeneratedConstraint: {
     auto iter = ConstraintList::iterator(TheConstraint.Constraint);
+    cs.removeInactiveDisjunction(TheConstraint.Constraint);
     cs.InactiveConstraints.erase(iter);
     break;
   }
@@ -656,6 +657,7 @@ void SolverTrail::Change::undo(ConstraintSystem &cs) const {
   case ChangeKind::RetiredConstraint:
     cs.InactiveConstraints.insert(Retiree.Where,
                                   Retiree.Constraint);
+    cs.restoreInactiveDisjunction(Retiree.Where, Retiree.Constraint);
     break;
 
   case ChangeKind::AddedLiteral: {
