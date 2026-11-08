@@ -50,6 +50,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SILOptimizer/Utils/InstructionChangeTracker.h"
 #include <functional>
 
 #ifndef SWIFT_SILOPTIMIZER_UTILS_INSTMODCALLBACKS_H
@@ -69,6 +70,11 @@ namespace swift {
 /// that in a loop this property should predict well since you have a single
 /// branch that is going to go the same way everytime.
 struct InstModCallbacks {
+  /// Optional pass-local region journal. Installing this does not make
+  /// arbitrary utilities completely tracked: the client must still fall back
+  /// for mutations which bypass these callbacks.
+  InstructionChangeTracker *changeTracker = nullptr;
+
   /// A function that is called to notify that a new function was created.
   ///
   /// Default implementation is a no-op, but we still mark madeChange.
@@ -139,6 +145,13 @@ struct InstModCallbacks {
   ~InstModCallbacks() = default;
   InstModCallbacks(const InstModCallbacks &) = default;
 
+  LLVM_ATTRIBUTE_UNUSED InstModCallbacks
+  withChangeTracker(InstructionChangeTracker *tracker) const {
+    InstModCallbacks result = *this;
+    result.changeTracker = tracker;
+    return result;
+  }
+
   /// Return a copy of self with deleteInstFunc set to \p newDeleteInstFunc.
   LLVM_ATTRIBUTE_UNUSED InstModCallbacks
   onDelete(decltype(deleteInstFunc) newDeleteInstFunc) const {
@@ -177,6 +190,8 @@ struct InstModCallbacks {
   void deleteInst(SILInstruction *instToDelete,
                   bool notifyWhenDeleting = true) {
     wereAnyCallbacksInvoked = true;
+    if (changeTracker)
+      changeTracker->recordDeletion(instToDelete);
     if (notifyWhenDeleting && notifyWillBeDeletedFunc)
       notifyWillBeDeletedFunc(instToDelete);
     if (deleteInstFunc)
@@ -186,12 +201,16 @@ struct InstModCallbacks {
 
   void createdNewInst(SILInstruction *newlyCreatedInst) {
     wereAnyCallbacksInvoked = true;
+    if (changeTracker)
+      changeTracker->recordInsertion(newlyCreatedInst);
     if (createdNewInstFunc)
       createdNewInstFunc(newlyCreatedInst);
   }
 
   void setUseValue(Operand *use, SILValue newValue) {
     wereAnyCallbacksInvoked = true;
+    if (changeTracker)
+      changeTracker->recordOperandChange(use, newValue);
     if (setUseValueFunc)
       return setUseValueFunc(use, newValue);
     use->set(newValue);
@@ -206,6 +225,8 @@ struct InstModCallbacks {
   /// rely on this ability, so we preserve it.
   void notifyWillBeDeleted(SILInstruction *instThatWillBeDeleted) {
     wereAnyCallbacksInvoked = true;
+    if (changeTracker)
+      changeTracker->observeInstruction(instThatWillBeDeleted);
     if (notifyWillBeDeletedFunc)
       return notifyWillBeDeletedFunc(instThatWillBeDeleted);
   }
@@ -213,14 +234,22 @@ struct InstModCallbacks {
   void replaceValueUsesWith(SILValue oldValue, SILValue newValue) {
     wereAnyCallbacksInvoked = true;
 
+    if (oldValue == newValue)
+      return;
+
     // If setUseValueFunc is not set, just call RAUW directly. RAUW in this case
     // is equivalent to what we do below. We just enable better
     // performance. This ensures that the default InstModCallback is really
     // fast.
-    if (!setUseValueFunc)
+    if (!setUseValueFunc &&
+        (!changeTracker || changeTracker->requiresFullScan()))
       return oldValue->replaceAllUsesWith(newValue);
 
     while (!oldValue->use_empty()) {
+      // Once the bounded journal falls back, no per-use tracking is needed.
+      // Preserve the original bulk operation for the remaining default uses.
+      if (!setUseValueFunc && changeTracker->requiresFullScan())
+        return oldValue->replaceAllUsesWith(newValue);
       auto *use = *oldValue->use_begin();
       setUseValue(use, newValue);
     }
@@ -239,7 +268,8 @@ struct InstModCallbacks {
     // is equivalent to what we do below. We just enable better
     // performance. This ensures that the default InstModCallback is really
     // fast.
-    if (!setUseValueFunc)
+    if (!setUseValueFunc &&
+        (!changeTracker || changeTracker->requiresFullScan()))
       return oldInst->replaceAllUsesPairwiseWith(newInst);
 
     auto results = oldInst->getResults();

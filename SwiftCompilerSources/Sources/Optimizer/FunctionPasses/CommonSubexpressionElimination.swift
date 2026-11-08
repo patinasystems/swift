@@ -339,10 +339,18 @@ private func tryCSEReplace(
     }
     availFwd.setForwardingOwnership(to: .none, context)
   }
+  // Preview the complete, existing RAUW-and-erase operation before changing
+  // any use. Only the pure/trivial subset can extend a settled SILCombine
+  // region. Other CSE operations retain the original behavior and invalidate
+  // that handoff through the pass context's notification serial.
+  let regionalReplacement = context.beginCSERegionReplacement(inst, with: availInst)
   for (result, availResult) in zip(inst.results, availInst.results) {
     result.uses.replaceAll(with: availResult, context)
   }
   context.erase(instruction: inst)
+  if regionalReplacement {
+    context.endCSERegionReplacement()
+  }
 }
 
 /// Update SIL basic block's arguments types which refer to opened

@@ -17,6 +17,7 @@
 #include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/NodeBits.h"
 #include "swift/SIL/OperandBits.h"
+#include <cstdint>
 
 namespace swift {
 
@@ -71,6 +72,12 @@ protected:
   /// Change notifications, collected during a pass run.
   NotificationKind changeNotifications = NotificationKind::Nothing;
 
+  /// Distinguishes a new mutation from an already-set notification bit. This
+  /// lets instruction-level clients conservatively detect unlocalized Swift
+  /// mutations without clearing pending analysis invalidation notifications.
+  /// Zero disables tracking, so ordinary compilation adds no serial stores.
+  uint64_t changeNotificationSerial = 0;
+
   void verifyEverythingIsCleared();
 
 public:
@@ -83,10 +90,18 @@ public:
   /// Called by the pass when changes are made to the SIL.
   void notifyChanges(NotificationKind notification) {
     changeNotifications = (NotificationKind)(changeNotifications | notification);
+    if (changeNotificationSerial && notification != NotificationKind::Nothing) {
+      if (++changeNotificationSerial == 0)
+        changeNotificationSerial = 1;
+    }
   }
 
   NotificationKind getChangeNotifications() const {
     return changeNotifications;
+  }
+
+  uint64_t getChangeNotificationSerial() const {
+    return changeNotificationSerial;
   }
 
   FixedSizeSlab *allocSlab(FixedSizeSlab *afterSlab);

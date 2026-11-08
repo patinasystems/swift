@@ -27,6 +27,7 @@
 #include "swift/SILOptimizer/Analysis/FunctionOrder.h"
 #include "swift/SILOptimizer/PassManager/PrettyStackTrace.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/InstructionChangeTracker.h"
 #include "swift/SILOptimizer/Utils/OptimizerStatsUtils.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
@@ -718,6 +719,10 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
 
   auto *SFT = cast<SILFunctionTransform>(Transformations[TransIdx]);
 
+  auto kind = SFT->getPassKind();
+  if (silCombineRegion.function && silCombineRegion.function != F)
+    invalidateSILCombineRegion();
+
   if (!F->shouldOptimize() && !isMandatoryFunctionPass(SFT)) {
     return;
   }
@@ -744,6 +749,19 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
       dumpPassInfo("(Disabled)", TransIdx, F);
     return;
   }
+
+  // The native completed bit certifies that the original SILCombine result is
+  // still current under the pass invalidation contract. Preserve only that
+  // empty saturation record; a dirty post-CSE payload has no such certificate.
+  // Completed/disabled passes above never run and need no additional barrier.
+  bool hasSaturationCertificate = silCombineRegion.function == F &&
+      silCombineRegion.blocks.empty() &&
+      completedPasses.test((size_t)PassKind::SILCombine);
+  if (kind != PassKind::SILCombine &&
+      kind != PassKind::CommonSubexpressionElimination &&
+      kind != PassKind::HighLevelCommonSubexpressionElimination &&
+      !hasSaturationCertificate)
+    invalidateSILCombineRegion();
 
   updateSILModuleStatsBeforeTransform(F->getModule(), SFT, *this, NumPassesRun);
 
@@ -873,6 +891,17 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
   if (!CurrentPassHasInvalidated && !currentPassDependsOnCalleeBodies)
     completedPasses.set((size_t)SFT->getPassKind());
 
+  // Publication is pending until the whole pass, including wrapper repairs
+  // and Swift notifications, satisfies the existing completion contract.
+  if (pendingSILCombineSaturation == F &&
+      SFT->getPassKind() == PassKind::SILCombine &&
+      !CurrentPassHasInvalidated && !currentPassDependsOnCalleeBodies) {
+    silCombineRegion.clear();
+    silCombineRegion.function = F;
+    silCombineRegion.fullReachableCount = pendingSILCombineCount;
+  }
+  pendingSILCombineSaturation = nullptr;
+
   if (getOptions().VerifyAll &&
       (CurrentPassHasInvalidated || SILVerifyWithoutInvalidation)) {
     F->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache(),
@@ -980,6 +1009,7 @@ runFunctionPasses(unsigned FromTransIdx, unsigned ToTransIdx) {
 }
 
 void SILPassManager::runModulePass(unsigned TransIdx) {
+  invalidateSILCombineRegion();
   auto *SMT = cast<SILModuleTransform>(Transformations[TransIdx]);
   if (isDisabled(SMT))
     return;
@@ -1248,6 +1278,7 @@ void SILPassManager::notifyOfNewFunction(SILFunction *F, SILTransform *T) {
 
 void SILPassManager::addFunctionToWorklist(SILFunction *F,
                                            SILFunction *DerivedFrom) {
+  invalidateSILCombineRegion();
   assert(F && F->isDefinition() && (isMandatory || F->shouldOptimize()) &&
          "Expected optimizable function definition!");
 
@@ -1306,6 +1337,7 @@ void SILPassManager::restartWithCurrentFunction(SILTransform *T) {
 /// Reset the state of the pass manager and remove all transformation
 /// owned by the pass manager. Analysis passes will be kept.
 void SILPassManager::resetAndRemoveTransformations() {
+  invalidateSILCombineRegion();
   for (auto *T : Transformations)
     delete T;
 
@@ -1313,6 +1345,7 @@ void SILPassManager::resetAndRemoveTransformations() {
 }
 
 void SILPassManager::setStageName(llvm::StringRef NextStage) {
+  invalidateSILCombineRegion();
   StageName = NextStage.str();
 }
 
@@ -1573,6 +1606,178 @@ void SILPassManager::viewCallGraph() {
 //                           SwiftPassInvocation
 //===----------------------------------------------------------------------===//
 
+void SILPassManager::invalidateSILCombineRegion() {
+  if (silCombineRegion.function)
+    silCombineRegion.clear();
+  if (pendingSILCombineSaturation)
+    pendingSILCombineSaturation = nullptr;
+  swiftPassInvocation.getCurrent()->invalidateCSERegionProducer();
+}
+
+void SILPassManager::invalidateFunctionAnalysis(
+    SILFunction *F, SILAnalysis::InvalidationKind K) {
+  for (auto *analysis : Analyses)
+    if (!analysis->isLocked())
+      analysis->invalidate(F, K);
+  CurrentPassHasInvalidated = true;
+  // Region tracking never preserves the generic completed-pass mask.
+  CompletedPassesMap[F].reset();
+}
+
+void SILPassManager::publishSILCombineSaturation(SILFunction *F,
+                                               unsigned fullReachableCount) {
+  auto *invocation = swiftPassInvocation.getCurrent();
+  if (SILOptProfileRepeat != 1 || invocation->getFunction() != F ||
+      !invocation->getTransform() ||
+      invocation->getTransform()->getPassKind() != PassKind::SILCombine ||
+      F->empty() || std::next(F->begin()) == F->end())
+    return;
+  pendingSILCombineSaturation = F;
+  pendingSILCombineCount = fullReachableCount;
+}
+
+bool SILPassManager::takeSILCombineRegion(
+    SILFunction *F, llvm::SmallVectorImpl<SILBasicBlock *> &blocks,
+    unsigned &updatedFullReachableCount) {
+  auto *invocation = swiftPassInvocation.getCurrent();
+  if (SILOptProfileRepeat != 1 || invocation->getFunction() != F ||
+      !invocation->getTransform() ||
+      invocation->getTransform()->getPassKind() != PassKind::SILCombine ||
+      silCombineRegion.function != F ||
+      silCombineRegion.blocks.empty())
+    return false;
+  blocks.assign(silCombineRegion.blocks.begin(), silCombineRegion.blocks.end());
+  updatedFullReachableCount = silCombineRegion.fullReachableCount;
+  silCombineRegion.clear();
+  return true;
+}
+
+bool SILPassManager::takeCSEBaseline(SILFunction *F, SILCombineRegion &region) {
+  if (SILOptProfileRepeat != 1 || silCombineRegion.function != F)
+    return false;
+  auto completed = CompletedPassesMap.find(F);
+  if (completed == CompletedPassesMap.end() ||
+      !completed->second.test((size_t)PassKind::SILCombine)) {
+    invalidateSILCombineRegion();
+    return false;
+  }
+  region = std::move(silCombineRegion);
+  silCombineRegion.clear();
+  return true;
+}
+
+void SILPassManager::acceptCSERegion(SILCombineRegion &&region) {
+  ASSERT(region.function && region.blocks.size() <= 64 &&
+         "invalid CSE region payload");
+  silCombineRegion = std::move(region);
+}
+
+void SwiftPassInvocation::invalidateCSERegionProducer() {
+  if (cseChangeTracker) {
+    cseChangeTracker->requireFullScan("intervening invalidation");
+    cseBaseline.clear();
+  }
+}
+
+bool SwiftPassInvocation::hasCoveredCSEChanges() const {
+  return cseChangeTracker && cseBaseline.function == function &&
+         !cseChangeTracker->requiresFullScan() && !cseTransactionOpen &&
+         cseExpectedSerial == getChangeNotificationSerial() &&
+         (changeNotifications & ~SILContext::NotificationKind::Instructions) == 0;
+}
+
+bool SwiftPassInvocation::beginCSERegionReplacement(
+    SILInstruction *oldInst, SILInstruction *replacement) {
+  if (!hasCoveredCSEChanges()) {
+    invalidateCSERegionProducer();
+    return false;
+  }
+  if (oldInst == replacement || oldInst->isDeleted() ||
+      replacement->isDeleted() || oldInst->getFunction() != function ||
+      replacement->getFunction() != function ||
+      oldInst->getResults().size() != replacement->getResults().size()) {
+    invalidateCSERegionProducer();
+    return false;
+  }
+  cseExpectedNotifications = 1; // The final context.erase notification.
+  cseChangeTracker->observeInstruction(replacement);
+  cseChangeTracker->recordDeletion(oldInst);
+  if (cseChangeTracker->requiresFullScan()) {
+    invalidateCSERegionProducer();
+    return false;
+  }
+  for (auto pair : llvm::zip(oldInst->getResults(), replacement->getResults())) {
+    SILValue oldValue = std::get<0>(pair), newValue = std::get<1>(pair);
+    if (oldValue->getType() != newValue->getType()) {
+      invalidateCSERegionProducer();
+      return false;
+    }
+    for (auto *use : oldValue->getUses()) {
+      // Debug salvage can create/remove additional instructions; this narrow
+      // transaction is exactly plain operand replacement followed by erase.
+      if (use->getUser()->isDebugInstruction()) {
+        invalidateCSERegionProducer();
+        return false;
+      }
+      cseChangeTracker->recordOperandChange(use, newValue);
+      if (cseChangeTracker->requiresFullScan()) {
+        invalidateCSERegionProducer();
+        return false;
+      }
+      ++cseExpectedNotifications;
+    }
+  }
+  if (cseChangeTracker->requiresFullScan()) {
+    invalidateCSERegionProducer();
+    return false;
+  }
+  cseTransactionSerial = getChangeNotificationSerial();
+  cseTransactionOpen = true;
+  return true;
+}
+
+void SwiftPassInvocation::endCSERegionReplacement() {
+  if (!cseTransactionOpen) {
+    invalidateCSERegionProducer();
+    return;
+  }
+  cseTransactionOpen = false;
+  uint64_t serial = getChangeNotificationSerial();
+  if (serial < cseTransactionSerial ||
+      serial - cseTransactionSerial != cseExpectedNotifications ||
+      (changeNotifications & ~SILContext::NotificationKind::Instructions) != 0) {
+    invalidateCSERegionProducer();
+    return;
+  }
+  cseExpectedSerial = serial;
+}
+
+void SwiftPassInvocation::finishCSERegionProducer() {
+  if (!cseChangeTracker)
+    return;
+  if (hasCoveredCSEChanges()) {
+    int64_t count = int64_t(cseBaseline.fullReachableCount) +
+                    cseChangeTracker->getInstructionCountChange();
+    if (count >= 0 && uint64_t(count) <= UINT_MAX) {
+      for (auto *block : cseChangeTracker->getDirtyBlocks()) {
+        if (!llvm::is_contained(cseBaseline.blocks, block))
+          cseBaseline.blocks.push_back(block);
+        if (cseBaseline.blocks.size() > 64)
+          break;
+      }
+      if (cseBaseline.blocks.size() <= 64) {
+        cseBaseline.fullReachableCount = unsigned(count);
+        passManager->acceptCSERegion(std::move(cseBaseline));
+      }
+    }
+  }
+  cseBaseline.clear();
+  // Destroy all instruction identity tokens before the PM deletion flush.
+  cseChangeTracker.reset();
+  cseTransactionOpen = false;
+  changeNotificationSerial = 0;
+}
+
 void SwiftPassInvocation::startModulePassRun(SILModuleTransform *transform) {
   ASSERT(!this->function && !this->transform && "a pass is already running");
   this->transform = transform;
@@ -1595,18 +1800,30 @@ void SwiftPassInvocation::startFunctionPassRun(SILFunctionTransform *transform) 
   ASSERT(!silCombiner && "didn't clear silCombiner backlink");
   this->transform = transform;
   this->function = transform->getFunction();
+  auto kind = transform->getPassKind();
+  if ((kind == PassKind::CommonSubexpressionElimination ||
+       kind == PassKind::HighLevelCommonSubexpressionElimination) &&
+      passManager->takeCSEBaseline(function, cseBaseline)) {
+    cseChangeTracker = std::make_unique<InstructionChangeTracker>(*function);
+    cseChangeTracker->reset();
+    changeNotificationSerial = 1;
+    cseExpectedSerial = 1;
+    cseTransactionOpen = false;
+  }
   ASSERT(!this->function->needBreakInfiniteLoops() && "didn't break infinite loops in previous module pass");
   ASSERT(!this->function->needCompleteLifetimes() && "didn't complete lifetimes in previous module pass");
 }
 
 void SwiftPassInvocation::finishedFunctionPassRun() {
   ASSERT(function && transform && "not running a function pass");
+  ASSERT(!instructionChangeTracker && "dirty-region journal outlives its client");
   ASSERT((changeNotifications & SILContext::NotificationKind::FunctionTables) == 0
          && "a function pass must not change function tables");
   ASSERT(!function->needBreakInfiniteLoops() && "didn't break infinite loops");
   ASSERT(!function->needCompleteLifetimes() && "didn't complete lifetimes");
 
   updateAnalysis();
+  finishCSERegionProducer();
 
   function = nullptr;
   transform = nullptr;
@@ -1616,16 +1833,33 @@ void SwiftPassInvocation::finishedFunctionPassRun() {
 
 void SwiftPassInvocation::updateAnalysis() {
   if (changeNotifications != SILContext::NotificationKind::Nothing) {
-    passManager->invalidateAnalysis(function, (SILAnalysis::InvalidationKind)changeNotifications);
+    auto kind = (SILAnalysis::InvalidationKind)changeNotifications;
+    if (hasCoveredCSEChanges()) {
+      // The same analysis/mask invalidation still happens. Only the separate
+      // dirty-region producer survives these precisely covered notifications.
+      passManager->invalidateFunctionAnalysis(function, kind);
+    } else {
+      passManager->invalidateAnalysis(function, kind);
+    }
   }
   changeNotifications = SILContext::NotificationKind::Nothing;
 }
 
 void SwiftPassInvocation::startInstructionPassRun(SILInstruction *inst) {
   ASSERT(inst->getFunction() == function && "running instruction pass on wrong function");
+  if (instructionChangeTracker)
+    instructionPassNotificationSerial = getChangeNotificationSerial();
 }
 
 void SwiftPassInvocation::finishedInstructionPassRun() {
+  // Swift instruction helpers currently report some changes only after
+  // replacing operands, and their SILCombine notifier may be empty. Such a
+  // notification cannot establish complete old/new SSA neighborhoods. Keep the
+  // existing full scan until a helper has precise mutation callbacks.
+  if (instructionChangeTracker &&
+      instructionPassNotificationSerial != getChangeNotificationSerial()) {
+    instructionChangeTracker->recordUnknownMutation("Swift instruction mutation");
+  }
   verifyEverythingIsCleared();
 }
 
@@ -1655,6 +1889,25 @@ void SwiftPassInvocation::endVerifyFunction(SILFunction *prevFunction) {
 
 irgen::IRGenModule *SwiftPassInvocation::getIRGenModule() {
   return passManager->getIRGenModule();
+}
+
+SwiftPassInvocation::SwiftPassInvocation(SILPassManager *passManager)
+    : SILContext(passManager->getModule()), passManager(passManager) {}
+
+SwiftPassInvocation::SwiftPassInvocation(SILPassManager *passManager,
+                                         SILTransform *transform,
+                                         SILFunction *function)
+    : SILContext(function), passManager(passManager), transform(transform) {}
+
+SwiftPassInvocation *SwiftPassInvocation::initializeNestedSwiftPassInvocation(
+    SILFunction *newFunction) {
+  ASSERT(!nestedSwiftPassInvocation && "Nested Swift pass invocation already initialized");
+  // Drop a paused outer producer BEFORE getCurrent() starts naming the nested
+  // invocation. Mutations there cannot be attributed to this CSE transaction.
+  passManager->invalidateSILCombineRegion();
+  nestedSwiftPassInvocation =
+      new SwiftPassInvocation(passManager, transform, newFunction);
+  return nestedSwiftPassInvocation;
 }
 
 SwiftPassInvocation::~SwiftPassInvocation() {}

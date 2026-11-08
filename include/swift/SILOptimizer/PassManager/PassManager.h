@@ -25,6 +25,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include <vector>
 #include <bitset>
+#include <memory>
 
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_PASSMANAGER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_PASSMANAGER_H
@@ -39,6 +40,7 @@ class SILOptions;
 class SILTransform;
 class SILPassManager;
 class SILCombiner;
+class InstructionChangeTracker;
 
 namespace irgen {
 class IRGenModule;
@@ -49,6 +51,20 @@ class IRGenerator;
 void executePassPipelinePlan(SILModule *SM, const SILPassPipelinePlan &plan,
                              bool isMandatory = false,
                              irgen::IRGenModule *IRMod = nullptr);
+
+/// The only state which may cross a function-pass deletion flush. Instruction
+/// identity tokens and observers are deliberately not part of this payload.
+struct SILCombineRegion {
+  SILFunction *function = nullptr;
+  llvm::SmallVector<SILBasicBlock *, 64> blocks;
+  unsigned fullReachableCount = 0;
+
+  void clear() {
+    function = nullptr;
+    blocks.clear();
+    fullReachableCount = 0;
+  }
+};
 
 /// Utility class to invoke Swift passes.
 class SwiftPassInvocation : public SILContext {
@@ -61,6 +77,21 @@ class SwiftPassInvocation : public SILContext {
   /// Non-null if this is an instruction simplification, invoked from SILCombine.
   SILCombiner *silCombiner = nullptr;
 
+  /// Non-owning; the optimizing client must unregister before destruction and
+  /// before the pass manager flushes deleted instructions.
+  InstructionChangeTracker *instructionChangeTracker = nullptr;
+  uint64_t instructionPassNotificationSerial = 0;
+
+  SILCombineRegion cseBaseline;
+  std::unique_ptr<InstructionChangeTracker> cseChangeTracker;
+  uint64_t cseExpectedSerial = 0;
+  uint64_t cseTransactionSerial = 0;
+  unsigned cseExpectedNotifications = 0;
+  bool cseTransactionOpen = false;
+
+  bool hasCoveredCSEChanges() const;
+  void finishCSERegionProducer();
+
   SwiftPassInvocation *nestedSwiftPassInvocation = nullptr;
 
   bool needFixStackNesting = false;
@@ -71,8 +102,7 @@ class SwiftPassInvocation : public SILContext {
 
 public:
   SwiftPassInvocation(SILPassManager *passManager, SILTransform *transform,
-                      SILFunction *function) :
-    SILContext(function), passManager(passManager), transform(transform) {}
+                      SILFunction *function);
 
   SwiftPassInvocation(SILPassManager *passManager);
 
@@ -96,6 +126,19 @@ public:
   void injectSILCombiner(SILCombiner *combiner) {
     silCombiner = combiner;
   }
+
+  void setInstructionChangeTracker(InstructionChangeTracker *tracker) {
+    instructionChangeTracker = tracker;
+    changeNotificationSerial = tracker ? 1 : 0;
+    instructionPassNotificationSerial = 0;
+  }
+
+  /// Only the audited synchronous CSE pairwise-RAUW plus erase sequence may
+  /// occur between these calls. A rejected begin leaves ordinary CSE intact.
+  bool beginCSERegionReplacement(SILInstruction *oldInst,
+                                SILInstruction *replacement);
+  void endCSERegionReplacement();
+  void invalidateCSERegionProducer();
 
   /// The top-level API to erase an instruction, called from the Swift pass.
   void eraseInstruction(SILInstruction *inst, bool salvageDebugInfo) override;
@@ -135,11 +178,7 @@ public:
   void setNeedFixStackNesting(bool newValue) { needFixStackNesting = newValue; }
   bool getNeedFixStackNesting() const { return needFixStackNesting; }
 
-  SwiftPassInvocation *initializeNestedSwiftPassInvocation(SILFunction *newFunction) {
-    ASSERT(!nestedSwiftPassInvocation && "Nested Swift pass invocation already initialized");
-    nestedSwiftPassInvocation = new SwiftPassInvocation(passManager, transform, newFunction);
-    return nestedSwiftPassInvocation;
-  }
+  SwiftPassInvocation *initializeNestedSwiftPassInvocation(SILFunction *newFunction);
 
   void deinitializeNestedSwiftPassInvocation() {
     ASSERT(nestedSwiftPassInvocation && "Nested Swift pass invocation not initialized");
@@ -152,6 +191,7 @@ public:
 /// The SIL pass manager.
 class SILPassManager {
   friend class ExecuteSILPipelineRequest;
+  friend class SwiftPassInvocation;
 
   /// The module that the pass manager will transform.
   SILModule *Mod;
@@ -216,6 +256,17 @@ class SILPassManager {
 
   bool currentPassDependsOnCalleeBodies = false;
 
+  /// One active function only. Switching function/stage or observing any
+  /// unlocalized mutation discards this state instead of maintaining a cache.
+  SILCombineRegion silCombineRegion;
+  SILFunction *pendingSILCombineSaturation = nullptr;
+  unsigned pendingSILCombineCount = 0;
+
+  void invalidateFunctionAnalysis(SILFunction *F,
+                                 SILAnalysis::InvalidationKind K);
+  bool takeCSEBaseline(SILFunction *F, SILCombineRegion &region);
+  void acceptCSERegion(SILCombineRegion &&region);
+
   /// True if we need to stop running passes and restart again on the
   /// same function.
   bool RestartPipeline = false;
@@ -272,6 +323,12 @@ public:
     return &swiftPassInvocation;
   }
 
+  void publishSILCombineSaturation(SILFunction *F, unsigned fullReachableCount);
+  bool takeSILCombineRegion(SILFunction *F,
+                           llvm::SmallVectorImpl<SILBasicBlock *> &blocks,
+                           unsigned &updatedFullReachableCount);
+  void invalidateSILCombineRegion();
+
   /// Restart the function pass pipeline on the same function
   /// that is currently being processed.
   void restartWithCurrentFunction(SILTransform *T);
@@ -280,6 +337,7 @@ public:
 
   /// Iterate over all analysis and invalidate them.
   void invalidateAllAnalysis() {
+    invalidateSILCombineRegion();
     // Invalidate the analysis (unless they are locked)
     for (auto AP : Analyses)
       if (!AP->isLocked())
@@ -306,6 +364,7 @@ public:
   /// is the job of the analysis to make sure no extra work is done if the
   /// particular analysis has been done on the function.
   void notifyAnalysisOfFunction(SILFunction *F) {
+    invalidateSILCombineRegion();
     for (auto AP : Analyses) {
       AP->notifyAddedOrModifiedFunction(F);
     }
@@ -314,19 +373,14 @@ public:
   /// Broadcast the invalidation of the function to all analysis.
   void invalidateAnalysis(SILFunction *F,
                           SILAnalysis::InvalidationKind K) {
-    // Invalidate the analysis (unless they are locked)
-    for (auto AP : Analyses)
-      if (!AP->isLocked())
-        AP->invalidate(F, K);
-    
-    CurrentPassHasInvalidated = true;
-    // Any change let all passes run again.
-    CompletedPassesMap[F].reset();
+    invalidateSILCombineRegion();
+    invalidateFunctionAnalysis(F, K);
   }
 
   /// Iterate over all analysis and notify them of a change in witness-
   /// or vtables.
   void invalidateFunctionTables() {
+    invalidateSILCombineRegion();
     // Invalidate the analysis (unless they are locked)
     for (auto AP : Analyses)
       if (!AP->isLocked())
@@ -340,6 +394,7 @@ public:
 
   /// Iterate over all analysis and notify them of a deleted function.
   void notifyWillDeleteFunction(SILFunction *F) {
+    invalidateSILCombineRegion();
     // Invalidate the analysis (unless they are locked)
     for (auto AP : Analyses)
       if (!AP->isLocked())
@@ -352,6 +407,7 @@ public:
 
   void setDependingOnCalleeBodies() {
     currentPassDependsOnCalleeBodies = true;
+    invalidateSILCombineRegion();
   }
 
   /// Reset the state of the pass manager and remove all transformation
@@ -462,9 +518,6 @@ private:
   /// When asserts are disabled, this is a NoOp.
   void viewCallGraph();
 };
-
-inline SwiftPassInvocation::SwiftPassInvocation(SILPassManager *passManager) :
-  SILContext(passManager->getModule()), passManager(passManager)  {}
 
 } // end namespace swift
 

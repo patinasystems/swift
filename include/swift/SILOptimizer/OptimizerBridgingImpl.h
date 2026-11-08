@@ -190,6 +190,16 @@ void BridgedPassContext::updateAnalysis() const {
   invocation->updateAnalysis();
 }
 
+bool BridgedPassContext::beginCSERegionReplacement(
+    BridgedInstruction oldInst, BridgedInstruction replacement) const {
+  return invocation->beginCSERegionReplacement(oldInst.unbridged(),
+                                               replacement.unbridged());
+}
+
+void BridgedPassContext::endCSERegionReplacement() const {
+  invocation->endCSERegionReplacement();
+}
+
 bool BridgedPassContext::hadError() const {
   return invocation->getPassManager()->getModule()->getASTContext().hadError();
 }

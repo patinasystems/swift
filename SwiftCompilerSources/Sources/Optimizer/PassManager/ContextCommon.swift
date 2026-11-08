@@ -59,6 +59,16 @@ extension Context {
 }
 
 extension MutatingContext {
+  /// Journal only the synchronous plain CSE replacement below this guard.
+  /// All other transformations keep using the ordinary invalidation path.
+  func beginCSERegionReplacement(_ old: Instruction, with replacement: Instruction) -> Bool {
+    bridgedPassContext.beginCSERegionReplacement(old.bridged, replacement.bridged)
+  }
+
+  func endCSERegionReplacement() {
+    bridgedPassContext.endCSERegionReplacement()
+  }
+
   func notifyInvalidatedStackNesting() { bridgedPassContext.notifyInvalidatedStackNesting() }
 
   func tryOptimizeApplyOfPartialApply(closure: PartialApplyInst) -> Bool {
