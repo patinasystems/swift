@@ -101,10 +101,12 @@ bb0:
 // aggregate is processed before the cast in this non-topological block layout.
 // CHECK-LABEL: sil [ossa] [opaque] @cast_exposes_visited_aggregate
 // CHECK-NOT: tuple_extract
-// CHECK: return [[VALUE:%.*]] : $Builtin.Int64
+// CHECK: br [[RETURN:bb[0-9]+]]([[VALUE:%.*]] : $Builtin.Int64)
 // CHECK-NOT: tuple_extract
 // CHECK: [[VALUE]] = integer_literal $Builtin.Int64, 42
 // CHECK-NOT: tuple_extract
+// CHECK: [[RETURN]]([[RESULT:%.*]] : $Builtin.Int64):
+// CHECK-NEXT: return [[RESULT]] : $Builtin.Int64
 // CHECK: } // end sil function 'cast_exposes_visited_aggregate'
 sil [ossa] @cast_exposes_visited_aggregate : $@convention(thin) () -> Builtin.Int64 {
 bb0:
@@ -113,12 +115,14 @@ bb1:
   checked_cast_br (Builtin.Int64, Builtin.Int64) in %pair : $(Builtin.Int64, Builtin.Int64) to (Builtin.Int64, Builtin.Int64), bb2, bb3
 bb2(%success : $(Builtin.Int64, Builtin.Int64)):
   %selected = tuple_extract %success : $(Builtin.Int64, Builtin.Int64), 1
-  return %selected : $Builtin.Int64
+  br bb5(%selected : $Builtin.Int64)
 bb3(%failure : $(Builtin.Int64, Builtin.Int64)):
   %zero = integer_literal $Builtin.Int64, 0
-  return %zero : $Builtin.Int64
+  br bb5(%zero : $Builtin.Int64)
 bb4:
   %value = integer_literal $Builtin.Int64, 42
   %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
   br bb1
+bb5(%result : $Builtin.Int64):
+  return %result : $Builtin.Int64
 }
