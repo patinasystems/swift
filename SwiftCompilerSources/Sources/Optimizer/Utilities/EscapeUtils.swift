@@ -352,7 +352,7 @@ fileprivate struct EscapeWalker<V: EscapeVisitor> : ValueDefUseWalker,
   }
   
   mutating func walkDown(value: Operand, path: Path) -> WalkResult {
-    if complexityBudgetExceeded(value.value) {
+    if complexityBudgetExceeded() {
       return .abortWalk
     }
     if hasRelevantType(value.value, at: path.projectionPath) {
@@ -488,7 +488,7 @@ fileprivate struct EscapeWalker<V: EscapeVisitor> : ValueDefUseWalker,
   }
   
   mutating func walkDown(address: Operand, path: Path) -> WalkResult {
-    if complexityBudgetExceeded(address.value) {
+    if complexityBudgetExceeded() {
       return .abortWalk
     }
     if hasRelevantType(address.value, at: path.projectionPath) {
@@ -799,7 +799,7 @@ fileprivate struct EscapeWalker<V: EscapeVisitor> : ValueDefUseWalker,
   }
   
   mutating func walkUp(value: Value, path: Path) -> WalkResult {
-    if complexityBudgetExceeded(value) {
+    if complexityBudgetExceeded() {
       return .abortWalk
     }
     if hasRelevantType(value, at: path.projectionPath) {
@@ -855,7 +855,7 @@ fileprivate struct EscapeWalker<V: EscapeVisitor> : ValueDefUseWalker,
   }
   
   mutating func walkUp(address: Value, path: Path) -> WalkResult {
-    if complexityBudgetExceeded(address) {
+    if complexityBudgetExceeded() {
       return .abortWalk
     }
     if hasRelevantType(address, at: path.projectionPath) {
@@ -994,7 +994,7 @@ fileprivate struct EscapeWalker<V: EscapeVisitor> : ValueDefUseWalker,
     return path.popLastClassAndValuesFromTail()
   }
 
-  private mutating func complexityBudgetExceeded(_ v: Value) -> Bool {
+  private mutating func complexityBudgetExceeded() -> Bool {
     if complexityBudget <= 0 {
       return true
     }
