@@ -1,0 +1,42 @@
+// RUN: %empty-directory(%t)
+// RUN: %gyb %s > %t/active-roots.sil
+// RUN: %target-sil-opt -enable-sil-verify-all -retain-sinking -late-release-hoisting %t/active-roots.sil | %FileCheck %t/active-roots.sil
+// RUN: %target-sil-opt -enable-sil-verify-all -release-hoisting %t/active-roots.sil | %FileCheck %t/active-roots.sil
+
+import Builtin
+
+sil_stage canonical
+
+// Use enough distinct roots to exercise multiple words in the dataflow
+// bitvectors. Each release blocks the active retain, then the next retain
+// generates a different root. Release hoisting cancels the adjacent pairs.
+// Cover both the single-iteration and converged dataflow paths.
+% for name, hasLoop in [('straight_line', False), ('loop', True)]:
+// CHECK-LABEL: sil @active_roots_${name}
+// CHECK-NOT: strong_retain
+// CHECK-NOT: strong_release
+// CHECK: return
+sil @active_roots_${name} : $@convention(thin) (${', '.join(['Builtin.NativeObject'] * 70)}, Builtin.Int1) -> () {
+bb0(${', '.join('%%root%d : $Builtin.NativeObject' % i for i in range(70))}, %condition : $Builtin.Int1):
+  br bb1
+
+bb1:
+% for i in range(70):
+  strong_retain %root${i} : $Builtin.NativeObject
+  strong_release %root${i} : $Builtin.NativeObject
+% end
+% if hasLoop:
+  cond_br %condition, bb2, bb3
+
+bb2:
+  br bb1
+% else:
+  br bb3
+% end
+
+bb3:
+  %%result = tuple ()
+  return %result : $()
+}
+
+% end
