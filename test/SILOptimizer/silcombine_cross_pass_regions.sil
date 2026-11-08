@@ -130,11 +130,20 @@ bb1:
 // CROSS: silcombine-regions function=cross_pass_branch_operand
 // CROSS-SAME: cross_pass_seeds=0
 // CHECK-LABEL: sil @cross_pass_branch_operand
-// CHECK: [[LESS:%.*]] = builtin "cmp_slt_Int64"
+// CHECK: bb0([[LEFT:%.*]] : $Builtin.Int64, [[RIGHT:%.*]] : $Builtin.Int64):
+// CHECK: [[LESS:%.*]] = builtin "cmp_slt_Int64"([[LEFT]] : $Builtin.Int64, [[RIGHT]] : $Builtin.Int64)
 // CHECK: cond_br [[LESS]], bb1, bb3
 // CHECK: bb1:
 // CHECK-NOT: builtin "cmp_slt_Int64"
-// CHECK: cond_br [[LESS]], bb2, bb3
+// CHECK: cond_br [[LESS]], bb2, bb4
+// CHECK: bb2:
+// CHECK: br bb5([[LEFT]] : $Builtin.Int64)
+// CHECK: bb3:
+// CHECK: br bb5([[RIGHT]] : $Builtin.Int64)
+// CHECK: bb4:
+// CHECK: br bb5([[RIGHT]] : $Builtin.Int64)
+// CHECK: bb5([[EXIT:%.*]] : $Builtin.Int64):
+// CHECK: return [[EXIT]] : $Builtin.Int64
 // CHECK: } // end sil function 'cross_pass_branch_operand'
 sil @cross_pass_branch_operand : $@convention(thin) (Builtin.Int64, Builtin.Int64) -> Builtin.Int64 {
 bb0(%left : $Builtin.Int64, %right : $Builtin.Int64):
@@ -143,15 +152,18 @@ bb0(%left : $Builtin.Int64, %right : $Builtin.Int64):
 
 bb1:
   %duplicate = builtin "cmp_slt_Int64"(%left : $Builtin.Int64, %right : $Builtin.Int64) : $Builtin.Int1
-  cond_br %duplicate, bb2, bb3
+  cond_br %duplicate, bb2, bb4
 
 bb2:
-  br bb4(%left : $Builtin.Int64)
+  br bb5(%left : $Builtin.Int64)
 
 bb3:
-  br bb4(%right : $Builtin.Int64)
+  br bb5(%right : $Builtin.Int64)
 
-bb4(%result : $Builtin.Int64):
+bb4:
+  br bb5(%right : $Builtin.Int64)
+
+bb5(%result : $Builtin.Int64):
   return %result : $Builtin.Int64
 }
 
