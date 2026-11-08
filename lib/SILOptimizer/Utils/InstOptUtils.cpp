@@ -158,15 +158,31 @@ bool swift::canDeleteDeadMoveOnlyOwnedDestructureInst(SILInstruction *inst) {
 ///
 /// This routine only examines the state of the instruction at hand.
 bool swift::isInstructionTriviallyDead(SILInstruction *inst) {
-  // At Onone, consider all uses, including the debug_info.
-  // This way, debug_info is preserved at Onone.
-  if (inst->hasUsesOfAnyResult()
-      && inst->getFunction()->getEffectiveOptimizationMode()
-             <= OptimizationMode::NoOptimization)
+  if (isa<TermInst>(inst))
     return false;
 
-  if (!onlyHaveDebugUsesOfAllResults(inst) || isa<TermInst>(inst))
-    return false;
+  // Inspect results and their uses once. An ordinary use keeps the instruction
+  // alive at every optimization level. Query the optimization mode only at the
+  // first debug use, so Onone also rejects a used definition without walking
+  // an arbitrarily long list of debug uses.
+  bool canIgnoreDebugUses = false;
+  for (auto result : inst->getResults()) {
+    auto use = result->use_begin(), end = result->use_end();
+    if (use == end)
+      continue;
+    if (!canIgnoreDebugUses) {
+      if (!use.getUser()->isDebugInstruction())
+        return false;
+      if (inst->getFunction()->getEffectiveOptimizationMode()
+          <= OptimizationMode::NoOptimization)
+        return false;
+      canIgnoreDebugUses = true;
+      ++use;
+    }
+    for (; use != end; ++use)
+      if (!use.getUser()->isDebugInstruction())
+        return false;
+  }
 
   if (auto *bi = dyn_cast<BuiltinInst>(inst)) {
     // Although the onFastPath builtin has no side-effects we don't want to

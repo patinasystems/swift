@@ -1,0 +1,98 @@
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -test-runner %s -o /dev/null 2>&1 | %FileCheck %s
+
+import Builtin
+
+// Debug-only uses may be removed while optimizing.
+// CHECK-LABEL: begin running test {{.*}} on optimized_debug_only
+// CHECK: deleteIfDead returned 1
+// CHECK-LABEL: end running test {{.*}} on optimized_debug_only
+sil [Ospeed] [ossa] @optimized_debug_only : $@convention(thin) () -> () {
+bb0:
+  specify_test "deleter_delete_if_dead @instruction"
+  %value = integer_literal $Builtin.Int64, 42
+  debug_value %value : $Builtin.Int64, let, name "value"
+  %void = tuple ()
+  return %void : $()
+}
+
+// At Onone the same debug-only definition must remain available.
+// CHECK-LABEL: begin running test {{.*}} on unoptimized_debug_only
+// CHECK: deleteIfDead returned 0
+// CHECK-LABEL: end running test {{.*}} on unoptimized_debug_only
+sil [Onone] [ossa] @unoptimized_debug_only : $@convention(thin) () -> () {
+bb0:
+  specify_test "deleter_delete_if_dead @instruction"
+  %value = integer_literal $Builtin.Int64, 42
+  debug_value %value : $Builtin.Int64, let, name "value"
+  %void = tuple ()
+  return %void : $()
+}
+
+// Unused definitions can still be removed at Onone.
+// CHECK-LABEL: begin running test {{.*}} on unoptimized_unused
+// CHECK: deleteIfDead returned 1
+// CHECK-LABEL: end running test {{.*}} on unoptimized_unused
+sil [Onone] [ossa] @unoptimized_unused : $@convention(thin) () -> () {
+bb0:
+  specify_test "deleter_delete_if_dead @instruction"
+  %value = integer_literal $Builtin.Int64, 42
+  %void = tuple ()
+  return %void : $()
+}
+
+// The first result is unused, but an ordinary use of a later result keeps the
+// entire multiple-result instruction alive.
+// CHECK-LABEL: begin running test {{.*}} on live_second_result
+// CHECK: deleteIfDead returned 0
+// CHECK-LABEL: end running test {{.*}} on live_second_result
+sil [Ospeed] [ossa] @live_second_result : $@convention(thin) () -> () {
+bb0:
+  %value = integer_literal $Builtin.Int64, 42
+  %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  specify_test "deleter_delete_if_dead @instruction"
+  (%first, %second) = destructure_tuple %pair : $(Builtin.Int64, Builtin.Int64)
+  %use = tuple (%second : $Builtin.Int64, %second : $Builtin.Int64)
+  %void = tuple ()
+  return %void : $()
+}
+
+// Debug-only uses of a later result do not keep an optimized instruction alive.
+// CHECK-LABEL: begin running test {{.*}} on debug_second_result
+// CHECK: deleteIfDead returned 1
+// CHECK-LABEL: end running test {{.*}} on debug_second_result
+sil [Ospeed] [ossa] @debug_second_result : $@convention(thin) () -> () {
+bb0:
+  %value = integer_literal $Builtin.Int64, 42
+  %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  specify_test "deleter_delete_if_dead @instruction"
+  (%first, %second) = destructure_tuple %pair : $(Builtin.Int64, Builtin.Int64)
+  debug_value %second : $Builtin.Int64, let, name "second"
+  %void = tuple ()
+  return %void : $()
+}
+
+// Instructions without results still need their side-effect classification.
+// CHECK-LABEL: begin running test {{.*}} on keep_store
+// CHECK: deleteIfDead returned 0
+// CHECK-LABEL: end running test {{.*}} on keep_store
+sil [Ospeed] [ossa] @keep_store : $@convention(thin) () -> () {
+bb0:
+  %stack = alloc_stack $Builtin.Int64
+  %value = integer_literal $Builtin.Int64, 42
+  specify_test "deleter_delete_if_dead @instruction"
+  store %value to [trivial] %stack : $*Builtin.Int64
+  dealloc_stack %stack : $*Builtin.Int64
+  %void = tuple ()
+  return %void : $()
+}
+
+// Terminators are never trivially dead, even though they have no results.
+// CHECK-LABEL: begin running test {{.*}} on keep_terminator
+// CHECK: deleteIfDead returned 0
+// CHECK-LABEL: end running test {{.*}} on keep_terminator
+sil [Ospeed] [ossa] @keep_terminator : $@convention(thin) () -> () {
+bb0:
+  %void = tuple ()
+  specify_test "deleter_delete_if_dead @instruction"
+  return %void : $()
+}
