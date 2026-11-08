@@ -1,0 +1,124 @@
+// RUN: %target-sil-opt -enable-sil-opaque-values -enable-sil-verify-all -diagnostic-constant-propagation %s | %FileCheck %s
+// RUN: %target-sil-opt -enable-sil-opaque-values -enable-sil-verify-all -performance-constant-propagation %s | %FileCheck %s
+
+// Aggregate checked casts are valid in opaque-value Raw SIL.
+sil_stage raw
+
+import Builtin
+
+struct Scalars {
+  var first: Builtin.Int64
+  var second: Builtin.Int64
+}
+
+struct Mixed {
+  var scalars: Scalars
+  var object: Builtin.NativeObject
+}
+
+// The inner tuple is visited before the outer tuple because block layout is
+// not dominance order. Forwarding the outer projection then exposes new users
+// of an aggregate whose original users have already been processed.
+// CHECK-LABEL: sil [ossa] [opaque] @new_users_of_visited_tuple
+// CHECK-NOT: tuple_extract
+// CHECK: [[ANSWER:%.*]] = integer_literal $Builtin.Int64, 42
+// CHECK-NEXT: return [[ANSWER]] : $Builtin.Int64
+// CHECK-NOT: tuple_extract
+// CHECK: } // end sil function 'new_users_of_visited_tuple'
+sil [ossa] @new_users_of_visited_tuple : $@convention(thin) () -> Builtin.Int64 {
+bb0:
+  br bb2
+bb1:
+  %outer = tuple (%inner : $(Builtin.Int64, Builtin.Int64), %twenty : $Builtin.Int64)
+  %forwarded = tuple_extract %outer : $((Builtin.Int64, Builtin.Int64), Builtin.Int64), 0
+  %selected = tuple_extract %forwarded : $(Builtin.Int64, Builtin.Int64), 1
+  %answer = builtin "add_Int64"(%first : $Builtin.Int64, %selected : $Builtin.Int64) : $Builtin.Int64
+  return %answer : $Builtin.Int64
+bb2:
+  %twenty = integer_literal $Builtin.Int64, 20
+  %twentytwo = integer_literal $Builtin.Int64, 22
+  %inner = tuple (%twenty : $Builtin.Int64, %twentytwo : $Builtin.Int64)
+  %first = tuple_extract %inner : $(Builtin.Int64, Builtin.Int64), 0
+  br bb1
+}
+
+// Partial destructures retain their owned result. Forward only the trivial
+// aggregate field, then fold its newly exposed tuple projection.
+// CHECK-LABEL: sil [ossa] [opaque] @partial_owned_tuple
+// CHECK: [[VALUE:%.*]] = integer_literal $Builtin.Int64, 42
+// CHECK: ({{%.*}}, [[OBJECT:%.*]]) = destructure_tuple
+// CHECK-NOT: tuple_extract
+// CHECK: [[RESULT:%.*]] = tuple ([[VALUE]] : $Builtin.Int64, [[OBJECT]] : $Builtin.NativeObject)
+// CHECK-NEXT: return [[RESULT]]
+sil [ossa] @partial_owned_tuple : $@convention(thin) (@owned Builtin.NativeObject) -> @owned (Builtin.Int64, Builtin.NativeObject) {
+bb0(%object : @owned $Builtin.NativeObject):
+  %value = integer_literal $Builtin.Int64, 42
+  %scalars = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  %mixed = tuple (%scalars : $(Builtin.Int64, Builtin.Int64), %object : $Builtin.NativeObject)
+  (%forwarded, %owned) = destructure_tuple %mixed : $((Builtin.Int64, Builtin.Int64), Builtin.NativeObject)
+  %selected = tuple_extract %forwarded : $(Builtin.Int64, Builtin.Int64), 1
+  %result = tuple (%selected : $Builtin.Int64, %owned : $Builtin.NativeObject)
+  return %result : $(Builtin.Int64, Builtin.NativeObject)
+}
+
+// Cover struct destructures and field projections with the same ownership
+// restriction: the nontrivial owned result must still come from destructuring.
+// CHECK-LABEL: sil [ossa] [opaque] @partial_owned_struct
+// CHECK: [[VALUE:%.*]] = integer_literal $Builtin.Int64, 42
+// CHECK: ({{%.*}}, [[OBJECT:%.*]]) = destructure_struct
+// CHECK-NOT: struct_extract
+// CHECK: [[RESULT:%.*]] = tuple ([[VALUE]] : $Builtin.Int64, [[OBJECT]] : $Builtin.NativeObject)
+// CHECK-NEXT: return [[RESULT]]
+sil [ossa] @partial_owned_struct : $@convention(thin) (@owned Builtin.NativeObject) -> @owned (Builtin.Int64, Builtin.NativeObject) {
+bb0(%object : @owned $Builtin.NativeObject):
+  %value = integer_literal $Builtin.Int64, 42
+  %scalars = struct $Scalars (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  %mixed = struct $Mixed (%scalars : $Scalars, %object : $Builtin.NativeObject)
+  (%forwarded, %owned) = destructure_struct %mixed : $Mixed
+  %selected = struct_extract %forwarded : $Scalars, #Scalars.second
+  %result = tuple (%selected : $Builtin.Int64, %owned : $Builtin.NativeObject)
+  return %result : $(Builtin.Int64, Builtin.NativeObject)
+}
+
+// The newly exposed users include an unused projection. Delayed deletion must
+// remove its queued operand before deleting the owner, while preserving the
+// live sibling's propagation.
+// CHECK-LABEL: sil [ossa] [opaque] @dead_new_aggregate_user
+// CHECK: [[VALUE:%.*]] = integer_literal $Builtin.Int64, 42
+// CHECK-NEXT: return [[VALUE]] : $Builtin.Int64
+sil [ossa] @dead_new_aggregate_user : $@convention(thin) () -> Builtin.Int64 {
+bb0:
+  %value = integer_literal $Builtin.Int64, 42
+  %inner = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  %outer = tuple (%inner : $(Builtin.Int64, Builtin.Int64), %value : $Builtin.Int64)
+  %forwarded = tuple_extract %outer : $((Builtin.Int64, Builtin.Int64), Builtin.Int64), 0
+  %unused = tuple_extract %forwarded : $(Builtin.Int64, Builtin.Int64), 0
+  %selected = tuple_extract %forwarded : $(Builtin.Int64, Builtin.Int64), 1
+  return %selected : $Builtin.Int64
+}
+
+// CastOptimizer replaces successor arguments outside its RAUW callbacks. The
+// aggregate is processed before the cast in this non-topological block layout.
+// CHECK-LABEL: sil [ossa] [opaque] @cast_exposes_visited_aggregate
+// CHECK-NOT: tuple_extract
+// CHECK: return [[VALUE:%.*]] : $Builtin.Int64
+// CHECK-NOT: tuple_extract
+// CHECK: [[VALUE]] = integer_literal $Builtin.Int64, 42
+// CHECK-NOT: tuple_extract
+// CHECK: } // end sil function 'cast_exposes_visited_aggregate'
+sil [ossa] @cast_exposes_visited_aggregate : $@convention(thin) () -> Builtin.Int64 {
+bb0:
+  br bb4
+bb1:
+  checked_cast_br (Builtin.Int64, Builtin.Int64) in %pair : $(Builtin.Int64, Builtin.Int64) to (Builtin.Int64, Builtin.Int64), bb2, bb3
+bb2(%success : $(Builtin.Int64, Builtin.Int64)):
+  %selected = tuple_extract %success : $(Builtin.Int64, Builtin.Int64), 1
+  return %selected : $Builtin.Int64
+bb3(%failure : $(Builtin.Int64, Builtin.Int64)):
+  %zero = integer_literal $Builtin.Int64, 0
+  return %zero : $Builtin.Int64
+bb4:
+  %value = integer_literal $Builtin.Int64, 42
+  %pair = tuple (%value : $Builtin.Int64, %value : $Builtin.Int64)
+  br bb1
+}
