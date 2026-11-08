@@ -1,0 +1,31 @@
+// RUN: %target-sil-opt -test-runner %s -o /dev/null | %FileCheck %s
+
+sil_stage canonical
+
+import Builtin
+
+// Distinct values of the same type must have independent path state. Three
+// values exercise both inline entries and the dictionary, including merging,
+// subsumption, and resetting a previously populated cache.
+// CHECK-LABEL: Walker cache in independent_values:
+// CHECK-NEXT: new: true
+// CHECK-NEXT: new: true
+// CHECK-NEXT: new: true
+// CHECK-NEXT: repeat: true
+// CHECK-NEXT: repeat: true
+// CHECK-NEXT: repeat: true
+// CHECK-NEXT: merge: true
+// CHECK-NEXT: merge: true
+// CHECK-NEXT: merge: true
+// CHECK-NEXT: subsumed: true
+// CHECK-NEXT: subsumed: true
+// CHECK-NEXT: subsumed: true
+// CHECK-NEXT: reset: true
+// CHECK-NEXT: reset: true
+// CHECK-NEXT: reset: true
+sil @independent_values : $@convention(thin) (Builtin.Int64, Builtin.Int64, Builtin.Int64) -> () {
+bb0(%0 : $Builtin.Int64, %1 : $Builtin.Int64, %2 : $Builtin.Int64):
+  specify_test "walker_cache %0 %1 %2"
+  %unit = tuple ()
+  return %unit : $()
+}
